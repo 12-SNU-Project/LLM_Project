@@ -1,82 +1,79 @@
-# 📊 SNU12 Team07 Project
+# 구조 우선 감사보고서 파이프라인
 
-<div align="center">
+해당 모듈은 삼성전자 감사보고서 HTML(`2014~2024`)을 `structure-first` 방식으로 파싱.
 
-![Project Status](https://img.shields.io/badge/status-in%20progress-yellow)
+1. HTML을 먼저 DOM 블록(`p/h/table`) 단위로 분해.
+2. 표를 RDB 적재용 `row/value` 구조로 정규화.
+3. 본문을 섹션 라벨 기반으로 VDB 청크로 생성.
+4. Markdown은 최종 저장본이 아니라 검수용 파생 산출물로 생성.
 
-**LLM 처리 기반 RAG 시스템 구현**
 
-</div>
+## 파일 구성
 
-## 프로젝트 소개
+- `structure_first_models.py`: 중간 객체 정의(`Block`, `NormalizedTable`, `TextChunk` 등)
+- `structure_first_utils.py`: 인코딩/텍스트 정규화/숫자 파싱 유틸
+- `structure_first_parser.py`: bs4 기반 메인 파서, 표 정규화, 메타데이터 생성, SQLite 저장
+- `run_structure_first_pipeline.py`: 전체 파이프라인 실행 CLI
+- `analyze_html_structure.py`: 연도별 HTML 구조 차이 분석 스크립트
+- `schema.sql`: RDB 스키마 초안
 
-본 프로젝트는 삼성전자의 2014–2024년 감사보고서 HTML 파일을 활용하여 금융 도메인 특화 NLP 시스템을 구축한다.
-HTML 파싱과 기본적인 데이터 파이프라인 구성을 토대로, CI/CD 환경을 갖춘 **완성도 있는 최종 응용 시스템**을 개발하는 것이 목표이다.
+## 실행 방법
 
----
+프로젝트 루트에서 실행:
 
-## 🛠 기술 스택
-### 
-### 사용 언어
-![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-### 패키지
-![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
-![BeautifulSoup](https://img.shields.io/badge/BeautifulSoup-44A833?style=for-the-badge&logo=html5&logoColor=white)
-### Tools
-![Conda](https://img.shields.io/badge/Anaconda-44A833?style=for-the-badge&logo=anaconda&logoColor=white)
-![Ollama](https://img.shields.io/badge/ollama-000000?style=for-the-badge&logo=ollama&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
----
-
-## 📁 프로젝트 구조 (업데이트)
+```bash
+python -m src.승담_수비.parsing.run_structure_first_pipeline --input-dir "" --output-dir ""
 ```
-📦 root
-├── 📂 prototype/                 # Streamlit 프로토타입
-│   └── app.py                    # 메인 Streamlit 앱 
-│
-├── 📂 src/                       # 소스코드
-│   ├── 📂 승담_수비/   
-│   ├── 📂 민환_주영/
-│   └── 📂 현서_재민/
-├── 📂 data/                      # 감사 보고서 문서
-├── 📂 docs/                      # 프로젝트 문서
-│
-├──  과제문서.ipynb
-├── .gitignore
-└──  README.md
+
+연도별 구조 분석:
+
+```bash
+python -m src.승담_수비.parsing.analyze_html_structure --input-dir "" --output ""
 ```
----
 
-## 팀원
-| 이름 | 역할 | GitHub |
-|--------|------|--------|
-| 오승담 | 개발 | [@seungdam](https://github.com/seungdam) |
-| 하재민 | 개발 | [@JMJM-create](https://github.com/JMJM-create) |
-| 박현서 | 개발 | [@hyeonseo021003-ops](https://github.com/hyeonseo021003-ops) |
-| 이민환 | 개발 | [@q277wsvtzt](https://github.com/q277wsvtzt) |
-| 오주영 | 개발 | [@dhwn1323-a11y](https://github.com/dhwn1323-a11y) |
-| 김수비 | 개발 |  |
----
+## Intermediate Representation 예시
 
+### Block 객체
 
-## 📊 주요 파이프라인
-**html 파싱 및 DB 구축**
-   - 테이블 / 주석 / 맥락을 고려한 파싱
-   - 주요 핵심 표에 대한 RDB(Relational Database 구축)
-   - VDB을 활용해 사용자 입력에 대한 컨텍스트 추출
----
+```json
+{
+  "block_id": "samsung_audit_2024_b0011",
+  "block_type": "table",
+  "dom_path": "/html/body/table[12]",
+  "section_id": "sec_003",
+  "section_type": "financial_statements",
+  "text": "과 목 주석 제 56 (당) 기 ..."
+}
+```
 
-## 📝 데이터 출처
- SNU 빅데이터 ai 핀테크 고급 전문가 과정에서 제공
----
+### Normalized Table 객체
 
-### 커밋 컨벤션
-- `feat`: 새로운 기능 추가
-- `fix`: 버그 수정
-- `docs`: 문서 수정
-- `style`: 코드 포맷팅, 세미콜론 누락 등
-- `refactor`: 코드 리팩토링
-- `test`: 테스트 코드
-- `chore`: 빌드, 프로젝트 설정 등
-- `add`: 새로운 파일 추가
----
+```json
+{
+  "table_id": "samsung_audit_2024_t0012",
+  "table_role": "financial_table",
+  "statement_type": "statement_of_financial_position",
+  "unit": "백만원",
+  "year_candidates": [2023, 2024],
+  "cells": [
+    {"cell_id": "...", "row_index": 0, "col_index": 0, "rowspan": 1, "colspan": 1, "is_header": true}
+  ],
+  "rows": [
+    {"row_id": "...", "normalized_label": "유동자산", "row_depth": 1, "parent_row_id": null}
+  ],
+  "values": [
+    {"value_id": "...", "row_id": "...", "period": "2024", "value_raw": "82,320,322", "value_numeric": 82320322.0}
+  ]
+}
+```
+
+### Text Chunk 객체
+
+```json
+{
+  "chunk_id": "samsung_audit_2024_ck00015",
+  "section_type": "independent_auditor_report",
+  "topic_hint": "audit_opinion",
+  "near_table_id": "samsung_audit_2024_t0012"
+}
+```
