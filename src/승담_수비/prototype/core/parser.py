@@ -6,19 +6,9 @@ from typing import List, Optional, Tuple
 
 from bs4 import BeautifulSoup, FeatureNotFound, Tag
 
-from models import Block, DocumentMeta, Section
+from models import Block, DocumentMeta, Section, AGGRESSIVE_RULES, CONSERVATIVE_RULES
 
-
-def decode_html_file(path: Path) -> Tuple[str, str]:
-    """DART 계열 파일을 위해 euc-kr/cp949 우선 디코딩."""
-    raw = path.read_bytes()
-    for enc in ("euc-kr", "cp949", "utf-8"):
-        try:
-            return raw.decode(enc), enc
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin1", errors="replace"), "latin1"
-
+from utils.structure_first_utils import decode_html_file
 
 class AuditReportParser:
     """Structure-first HTML 블록 파서."""
@@ -31,12 +21,20 @@ class AuditReportParser:
         r"^외부감사\s*실시내용$",
     )
 
-    def __init__(self, html_content: str, parser_backends: Optional[List[str]] = None):
+    def __init__(self, 
+                html_content: str,
+                parser_backends: Optional[List[str]] = None, 
+                section_mode: str = "auto" # "auto" | "conservation" | "aggressive"
+                ):   
         self.html_content = html_content
         self.parser_backends = parser_backends or ["lxml", "html5lib", "html.parser"]
         self.soup, self.parser_backend = self._make_soup(html_content)
         self.blocks: List[Block] = []
         self.sections: List[Section] = []
+
+        # doucument meta 정보를 바탕으로 섹션 헤더 해석을 다르게 하도록 모드 추가
+        self.document_meta: Optional[DocumentMeta] = None
+        self.section_mode= section_mode
 
     def _make_soup(self, html_content: str) -> Tuple[BeautifulSoup, str]:
         for backend in self.parser_backends:
@@ -392,3 +390,43 @@ class AuditReportParser:
                     if table_text:
                         texts.append(table_text)
         return "\n".join(texts)
+
+    # Heading 정규화 내용 추가
+    @staticmethod
+    def _normalize_heading_text(text: str) -> str:
+        text = text.replace("\xa0"," ")
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"[：:]+$", "", text)
+        text = re.sub(r"[.]+$", "", text)
+        return text 
+    
+    @classmethod
+    def _compact_heading_text(cls, text: str) -> str:
+        return re.sub(r"\s+","",cls._normalize_heading_text(text))
+
+    def _choose_section_rulse(self):
+        fiscal_year = self.document_meta.fiscal_year if self.extract_document_meta else None
+        if self.section_mode == "conservation":
+            return CONSERVATIVE_RULES
+        if self.section_mode == "aggressive":
+            return AGGRESSIVE_RULES
+        
+        if fiscal_year is not None and fiscal_year <= 2018:
+            return CONSERVATIVE_RULES
+        return AGGRESSIVE_RULES
+    
+    def _match_section_rulse(
+            self,
+            text: str,
+            parent_section_type: Optional[str] = None,
+    ):
+        compact = self._compact_heading_text(text)
+        matches = []
+
+        for rule in self._choose_section_rulse():
+            if re.search(rule["pattern"], compact):
+                parent_types = rule["parent_types"]
+                if parent_types is None or parent_section_type in parent_types:
+                    matches.append(rule)
+        matches.sort(key=lambda r: (r["priority"], len(r["pattern"])), reverse=True)
+        return matches
