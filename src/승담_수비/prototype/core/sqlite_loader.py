@@ -4,7 +4,10 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-from pipeline import AuditReportPipeline
+try:
+    from .pipeline import AuditReportPipeline
+except ImportError:
+    from pipeline import AuditReportPipeline
 
 
 class SQLiteLoader:
@@ -12,6 +15,7 @@ class SQLiteLoader:
 
     TABLE_ORDER = [
         "filings",
+        "blocks",
         "sections",
         "tables",
         "table_rows",
