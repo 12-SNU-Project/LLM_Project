@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 @dataclass
 class DocumentMeta:
     """감사보고서 문서 전체 메타데이터."""
-
     filing_id: str
     company_name: str
     fiscal_year: Optional[int] = None
@@ -23,13 +22,14 @@ class DocumentMeta:
 @dataclass
 class Block:
     """DOM에서 분해된 기본 블록 단위."""
-
     block_id: str
     block_type: str  # cover | section_heading | paragraph | table | footnote | page_break
     text: str
     html_fragment: str
     dom_path: str
     order_index: int
+    filing_id: Optional[str] = None
+    page_index: Optional[int] = None
     prev_block_id: Optional[str] = None
     next_block_id: Optional[str] = None
     section_id: Optional[str] = None
@@ -41,7 +41,6 @@ class Block:
 @dataclass
 class Section:
     """블록 묶음으로 구성되는 섹션 단위."""
-    
     section_id: str
     filing_id: str
     section_type: str
@@ -50,14 +49,13 @@ class Section:
     end_block_id: Optional[str] = None
     order_index: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
-
     parent_section_id: Optional[str] = None
     section_level: int = 0
+
 
 @dataclass
 class TableCell:
     """정규화된 논리 grid의 셀."""
-
     cell_id: str
     row_index: int
     col_index: int
@@ -80,7 +78,6 @@ class TableCell:
 @dataclass
 class TableRow:
     """RDB 적재 기준의 표 행 객체."""
-
     row_id: str
     table_id: str
     row_index: int
@@ -95,12 +92,13 @@ class TableRow:
 @dataclass
 class TableValue:
     """RDB 적재 기준의 표 값 객체."""
-
     value_id: str
     table_id: str
     row_id: str
     col_index: int
+    column_key: str
     period: Optional[str]
+    value_role: Optional[str]
     value_raw: str
     value_numeric: Optional[float]
     unit: Optional[str]
@@ -113,17 +111,20 @@ class TableValue:
 @dataclass
 class NormalizedTable:
     """rowspan/colspan 해체 후의 intermediate table object."""
-
     table_id: str
     filing_id: str
     source_block_id: str
     statement_type: Optional[str] = None
-    table_role: str = "unknown_table"  # cover_table | financial_table | internal_control_table | unknown_table
+    table_role: str = "unknown_table" # cover_table | financial_table | internal_control_table | unknown_table
+    table_subrole: Optional[str] = None
     title: Optional[str] = None
     unit: Optional[str] = None
     year_candidates: List[int] = field(default_factory=list)
     context_before: Optional[str] = None
     context_after: Optional[str] = None
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    source_file: Optional[str] = None
     section_id: Optional[str] = None
     section_type: Optional[str] = None
     section_title: Optional[str] = None
@@ -140,10 +141,10 @@ class NormalizedTable:
 @dataclass
 class TextChunk:
     """VDB 적재용 텍스트 청크."""
-
     chunk_id: str
     filing_id: str
     fiscal_year: Optional[int]
+    section_id: Optional[str]
     section_type: Optional[str]
     section_title: Optional[str]
     auditor_name: Optional[str]
@@ -152,13 +153,15 @@ class TextChunk:
     text: str
     start_block_id: str
     end_block_id: str
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    source_file: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FilingParseResult:
     """단일 보고서 파싱 결과 전체."""
-
     meta: DocumentMeta
     blocks: List[Block]
     sections: List[Section]
