@@ -1,0 +1,1 @@
+"""Core parsing and normalization pipeline components."""
