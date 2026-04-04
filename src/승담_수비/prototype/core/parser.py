@@ -6,25 +6,219 @@ from typing import List, Optional, Tuple
 
 from bs4 import BeautifulSoup, FeatureNotFound, Tag
 
-from models import Block, DocumentMeta, Section, AGGRESSIVE_RULES, CONSERVATIVE_RULES
+from models import Block, DocumentMeta, Section
 
 from utils.structure_first_utils import decode_html_file
 
+SECTION_TITLE_PATTERNS = (
+    r"독립된\s*감사인의\s*감사보고서",
+    r"\(첨부\)\s*재\s*무\s*제\s*표",
+    r"^주석$",
+    r"내부회계관리제도\s*(감사\s*또는\s*검토의견|검토의견)",
+    r"^외부감사\s*실시내용$",
+    r"^감사의견$",
+    r"^핵심감사사항$",
+    r"^\d+\.\s*감사대상업무$",
+    r"^\d+(\.\d+)*\s*보고기간\s*후\s*사건$",
+)
+
+SECTION_RULES = [
+    # ---------- 하위 섹션(구체적 패턴 우선) ----------
+    {
+        "pattern": r"^감사의견$",
+        "section_type": "audit_opinion",
+        "level": "sub",
+        "priority": 100,
+        "parent_types": {"independent_auditor_report"},
+    },
+    {
+        "pattern": r"^핵심감사사항$",
+        "section_type": "key_audit_matters",
+        "level": "sub",
+        "priority": 100,
+        "parent_types": {"independent_auditor_report"},
+    },
+    {
+        "pattern": r"내부회계관리제도에대한감사의견",
+        "section_type": "internal_control_audit_opinion",
+        "level": "sub",
+        "priority": 120,
+        "parent_types": {"internal_control_opinion"},
+    },
+    {
+        "pattern": r"내부회계관리제도감사의견근거",
+        "section_type": "internal_control_audit_basis",
+        "level": "sub",
+        "priority": 120,
+        "parent_types": {"internal_control_opinion"},
+    },
+    {
+        "pattern": r"^\d+\.\s*감사대상업무$",
+        "section_type": "external_audit_target_work",
+        "level": "sub",
+        "priority": 110,
+        "parent_types": {"external_audit_activity"},
+    },
+    {
+        "pattern": r"^\d+\.\s*감사참여자구분별인원수및감사시간$",
+        "section_type": "external_audit_hours",
+        "level": "sub",
+        "priority": 110,
+        "parent_types": {"external_audit_activity"},
+    },
+    {
+        "pattern": r"^\d+(\.\d+)*\s*보고기간후사건$",
+        "section_type": "subsequent_events",
+        "level": "sub",
+        "priority": 105,
+        "parent_types": {"notes", "attached_financial_statements", "other"},
+    },
+    {
+        "pattern": r"^\d+(\.\d+)*\s*우발부채와약정사항$",
+        "section_type": "contingent_liabilities_and_commitments",
+        "level": "sub",
+        "priority": 105,
+        "parent_types": {"notes", "attached_financial_statements", "other"},
+    },
+
+    # ---------- 상위 섹션 ----------
+    {
+        "pattern": r"독립된감사인의감사보고서",
+        "section_type": "independent_auditor_report",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"\(첨부\)재무제표",
+        "section_type": "attached_financial_statements",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"^주석$",
+        "section_type": "notes",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"내부회계관리제도(감사또는검토의견|검토의견)",
+        "section_type": "internal_control_opinion",
+        "level": "top",
+        "priority": 60,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"^외부감사실시내용$",
+        "section_type": "external_audit_activity",
+        "level": "top",
+        "priority": 60,
+        "parent_types": None,
+    },
+]
+
+CONSERVATIVE_RULES = [
+    # 상위 섹션
+    {
+        "pattern": r"독립된감사인의감사보고서",
+        "section_type": "independent_auditor_report",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"\(첨부\)재무제표",
+        "section_type": "attached_financial_statements",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"^주석$",
+        "section_type": "notes",
+        "level": "top",
+        "priority": 50,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"내부회계관리제도(감사또는검토의견|검토의견)",
+        "section_type": "internal_control_opinion",
+        "level": "top",
+        "priority": 60,
+        "parent_types": None,
+    },
+    {
+        "pattern": r"^외부감사실시내용$",
+        "section_type": "external_audit_activity",
+        "level": "top",
+        "priority": 60,
+        "parent_types": None,
+    },
+
+    # 보수적 모드에서도 확실한 하위 섹션은 허용
+    {
+        "pattern": r"^\d+(\.\d+)*보고기간후사건$",
+        "section_type": "subsequent_events",
+        "level": "sub",
+        "priority": 90,
+        "parent_types": {"notes", "attached_financial_statements", "cover", "other"},
+    },
+    {
+        "pattern": r"^\d+\.\s*감사대상업무$",
+        "section_type": "external_audit_target_work",
+        "level": "sub",
+        "priority": 95,
+        "parent_types": {"external_audit_activity"},
+    },
+    {
+        "pattern": r"^\d+\.\s*감사참여자구분별인원수및감사시간$",
+        "section_type": "external_audit_hours",
+        "level": "sub",
+        "priority": 95,
+        "parent_types": {"external_audit_activity"},
+    },
+]
+
+AGGRESSIVE_RULES = CONSERVATIVE_RULES + [
+    {
+        "pattern": r"^감사의견$",
+        "section_type": "audit_opinion",
+        "level": "sub",
+        "priority": 100,
+        "parent_types": {"independent_auditor_report"},
+    },
+    {
+        "pattern": r"^핵심감사사항$",
+        "section_type": "key_audit_matters",
+        "level": "sub",
+        "priority": 100,
+        "parent_types": {"independent_auditor_report"},
+    },
+    {
+        "pattern": r"내부회계관리제도에대한감사의견",
+        "section_type": "internal_control_audit_opinion",
+        "level": "sub",
+        "priority": 120,
+        "parent_types": {"internal_control_opinion"},
+    },
+    {
+        "pattern": r"내부회계관리제도감사의견근거",
+        "section_type": "internal_control_audit_basis",
+        "level": "sub",
+        "priority": 120,
+        "parent_types": {"internal_control_opinion"},
+    },
+]
+
 class AuditReportParser:
     """Structure-first HTML 블록 파서."""
-
-    SECTION_TITLE_PATTERNS = ( # 정규화 패턴
-        r"독립된\s*감사인의\s*감사보고서",
-        r"\(첨부\)\s*재\s*무\s*제\s*표",
-        r"^주석$",
-        r"내부회계관리제도\s*(감사\s*또는\s*검토의견|검토의견)",
-        r"^외부감사\s*실시내용$",
-    )
-
+    
     def __init__(self, 
                 html_content: str,
                 parser_backends: Optional[List[str]] = None, 
-                section_mode: str = "auto" # "auto" | "conservation" | "aggressive"
+                section_mode: str = "auto" # "auto" | "conservative" | "aggressive"
                 ):   
         self.html_content = html_content
         self.parser_backends = parser_backends or ["lxml", "html5lib", "html.parser"]
@@ -75,7 +269,32 @@ class AuditReportParser:
     def _is_section_title_text(self, text: str) -> bool:
         if not text:
             return False
-        return any(re.search(pattern, text) for pattern in self.SECTION_TITLE_PATTERNS)
+        compact = self._compact_heading_text(text)
+
+        return any(re.search(pattern, compact) for pattern in SECTION_TITLE_PATTERNS)
+
+    def _detect_heading_level(
+            self,
+            element: Tag,
+            text: str,
+            parent_section_type: Optional[str] = None,
+    ) -> Optional[str]:
+        if not text:
+            return None
+        normalized = self._normalize_heading_text(text)
+        class_names = self._extract_class_names(element)
+        style = (element.get("style") or "").lower()
+        is_bold = element.find("b") is not None or "font-weight:bold" in style
+        is_heading_tag = element.name in {"h1", "h2", "h3"}
+        is_section_class = any(name.startswith("section-") for name in class_names)
+        matches = self._match_section_rules(text, parent_section_type)
+        if not matches:
+            return None
+        best = matches[0]
+        if len(normalized) > 80 and not (is_bold or is_heading_tag or is_section_class):
+            return None
+        
+        return best["level"]
 
     def _is_cover_text(self, text: str) -> bool:
         if not text:
@@ -138,19 +357,16 @@ class AuditReportParser:
 
         return "paragraph"
 
-    @staticmethod
-    def _infer_section_type(title: str) -> str:
-        normalized = title.replace(" ", "")
-        if "독립된감사인의감사보고서" in normalized:
-            return "independent_auditor_report"
-        if "재무제표" in normalized and "첨부" in normalized:
-            return "attached_financial_statements"
-        if normalized == "주석":
-            return "notes"
-        if "내부회계관리제도" in normalized:
-            return "internal_control_opinion"
-        if "외부감사실시내용" in normalized:
-            return "external_audit_activity"
+    def _infer_section_type(
+        self,
+        title: str,
+        parent_section_type: Optional[str] = None,
+        ) -> str:
+        matches = self._match_section_rules(title, parent_section_type)
+        if matches:
+            return matches[0]["section_type"]
+
+        normalized = self._compact_heading_text(title)
         if "감사보고서" in normalized:
             return "cover"
         return "other"
@@ -222,6 +438,83 @@ class AuditReportParser:
         return self.blocks
 
     def build_sections(self, filing_id: str) -> List[Section]:
+        if not self.blocks:
+            self.parse()
+        if not self.document_meta:
+            self.document_meta = self.extract_document_meta(filing_id)
+
+        sections: List[Section] = []
+
+        root = Section(
+            section_id=f"{filing_id}_s000",
+            filing_id=filing_id,
+            section_type="cover",
+            section_title="표지",
+            start_block_id=self.blocks[0].block_id,
+            order_index=0,
+            parent_section_id=None,
+            section_level=1,
+        )
+        sections.append(root)
+
+        current_top = root
+        current_leaf = root
+
+        for block in self.blocks:
+            if block.block_type == "section_heading":
+                heading_text = block.text or "제목없음"
+                elem = BeautifulSoup(block.html_fragment, "html.parser").find()
+                level = self._detect_heading_level(elem,
+                    heading_text,
+                    current_top.section_type if current_top else None,)
+
+                if level == "top":
+                    if current_leaf.start_block_id != block.block_id:
+                        current_leaf.end_block_id = block.prev_block_id
+
+                    new_section = Section(
+                        section_id=f"{filing_id}_s{len(sections):03d}",
+                        filing_id=filing_id,
+                        section_type=self._infer_section_type(heading_text, None),
+                        section_title=heading_text,
+                        start_block_id=block.block_id,
+                        order_index=len(sections),
+                        parent_section_id=None,
+                        section_level=1,
+                    )
+                    sections.append(new_section)
+                    current_top = new_section
+                    current_leaf = new_section
+
+                elif level == "sub":
+                    if current_leaf.start_block_id != block.block_id:
+                        current_leaf.end_block_id = block.prev_block_id
+
+                    new_section = Section(
+                        section_id=f"{filing_id}_s{len(sections):03d}",
+                        filing_id=filing_id,
+                        section_type=self._infer_section_type(
+                            heading_text,
+                            current_top.section_type if current_top else None,
+                        ),
+                        section_title=heading_text,
+                        start_block_id=block.block_id,
+                        order_index=len(sections),
+                        parent_section_id=current_top.section_id if current_top else None,
+                        section_level=2,
+                    )
+                    sections.append(new_section)
+                    current_leaf = new_section
+
+            block.section_id = current_leaf.section_id
+            block.section_type = current_leaf.section_type
+            block.section_title = current_leaf.section_title
+
+        current_leaf.end_block_id = self.blocks[-1].block_id
+        self.sections = sections
+        return sections
+
+    def build_sections(self, filing_id: str) -> List[Section]:
         """블록 시퀀스를 섹션 단위로 라벨링."""
         if not self.blocks:
             self.parse()
@@ -238,8 +531,13 @@ class AuditReportParser:
             section_title="표지",
             start_block_id=self.blocks[0].block_id,
             order_index=0,
+            parent_section_id=None,
+            section_level=1,
         )
         sections.append(current_section)
+
+        current_top = current_section
+        current_leaf = current_section
 
         for block in self.blocks:
             if block.block_type == "section_heading":
@@ -406,7 +704,7 @@ class AuditReportParser:
 
     def _choose_section_rulse(self):
         fiscal_year = self.document_meta.fiscal_year if self.extract_document_meta else None
-        if self.section_mode == "conservation":
+        if self.section_mode == "conservative":
             return CONSERVATIVE_RULES
         if self.section_mode == "aggressive":
             return AGGRESSIVE_RULES
@@ -415,7 +713,7 @@ class AuditReportParser:
             return CONSERVATIVE_RULES
         return AGGRESSIVE_RULES
     
-    def _match_section_rulse(
+    def _match_section_rules(
             self,
             text: str,
             parent_section_type: Optional[str] = None,
