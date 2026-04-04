@@ -5,12 +5,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bs4 import BeautifulSoup, FeatureNotFound, Tag
 
-from models import Block, NormalizedTable, TableCell, TableRow, TableValue
+try:
+    from .models import Block, NormalizedTable, TableCell, TableRow, TableValue
+except ImportError:
+    from models import Block, NormalizedTable, TableCell, TableRow, TableValue
 
 
 class TableProcessor:
-    """구조 보존형 테이블 정규화기."""
-
     FINANCIAL_KEYWORDS = (
         "재무상태표",
         "손익계산서",
@@ -25,18 +26,32 @@ class TableProcessor:
     )
     INTERNAL_CONTROL_KEYWORDS = (
         "내부회계관리제도",
-        "운영실태",
-        "감사계획",
-        "커뮤니케이션",
+        "감사의견",
+        "검토의견",
     )
-    HEADER_KEYWORDS = ("과목", "구분", "주석", "당기", "전기", "금액", "단위", "기초", "기말")
-    STATEMENT_TYPE_MAP = {
+    HEADER_KEYWORDS = (
+        "과목",
+        "구분",
+        "기업명",
+        "내역",
+        "항목",
+        "주석",
+        "당기",
+        "전기",
+        "기말",
+        "기초",
+        "단위",
+    )
+    STATEMENT_TYPE_MAP = { # db에 저장할 키워드
+        "포괄손익계산서": "statement_of_comprehensive_income",
         "재무상태표": "statement_of_financial_position",
         "손익계산서": "income_statement",
-        "포괄손익계산서": "statement_of_comprehensive_income",
         "자본변동표": "statement_of_changes_in_equity",
         "현금흐름표": "cash_flow_statement",
     }
+    NOTE_COLUMN_KEYWORDS = ("주석",)
+    LABEL_COLUMN_KEYWORDS = ("과목", "구분", "기업명", "내역", "항목", "종류")
+    PERIOD_KEYWORDS = ("당기", "전기", "당기말", "전기말", "기말", "기초", "반기", "분기")
 
     def __init__(
         self,
@@ -45,7 +60,7 @@ class TableProcessor:
         fiscal_year: Optional[int] = None,
         context_before: Optional[str] = None,
         context_after: Optional[str] = None,
-    ):
+    ) -> None:
         self.block = block
         self.filing_id = filing_id
         self.fiscal_year = fiscal_year
@@ -74,52 +89,50 @@ class TableProcessor:
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        compact = text.replace("\xa0", " ")
-        compact = re.sub(r"\s+", " ", compact)
-        return compact.strip()
+        return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+    @classmethod
+    def _compact_text(cls, text: str) -> str:
+        return re.sub(r"\s+", "", cls._normalize_text(text))
 
     @staticmethod
     def _leading_indent_score(raw_text: str) -> int:
         """원본 텍스트 선행 공백/nbsp를 계층 신호로 환산."""
-        if not raw_text:
+        prefix = re.match(r"^[\s\xa0]*", raw_text or "")
+        if not prefix:
             return 0
-        prefix_match = re.match(r"^[\s\xa0]*", raw_text)
-        prefix = prefix_match.group(0) if prefix_match else ""
         score = 0
-        for ch in prefix:
-            if ch == "\xa0":
-                score += 2
-            elif ch == " ":
-                score += 1
-            elif ch in {"\t", "\n", "\r"}:
-                score += 1
+        for ch in prefix.group(0):
+            score += 2 if ch == "\xa0" else 1
         return score
 
     @staticmethod
     def _is_numeric_text(text: str) -> bool:
         stripped = text.strip()
-        if stripped in {"", "-", "—", "N/A"}:
+        if stripped in {"", "-", "N/A"}:
             return False
-        candidate = stripped.replace(",", "").replace(" ", "")
-        candidate = candidate.strip("()")
-        return bool(re.fullmatch(r"-?\d+(\.\d+)?", candidate))
+        candidate = stripped.strip("()")
+        candidate = candidate.replace(" ", "")
+        return bool(
+            re.fullmatch(r"-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?", candidate)
+        )
 
     @staticmethod
     def _parse_numeric(text: str) -> Optional[float]:
         stripped = text.strip()
-        if stripped in {"", "-", "—", "N/A"}:
+        if stripped in {"", "-", "N/A"}:
             return None
-
         negative = stripped.startswith("(") and stripped.endswith(")")
-        candidate = stripped.replace(",", "").replace(" ", "").strip("()")
-        if not re.fullmatch(r"-?\d+(\.\d+)?", candidate):
+        candidate = stripped.strip("()").replace(" ", "")
+        if not re.fullmatch(r"-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?", candidate):
             return None
+        candidate = candidate.replace(",", "")
         value = float(candidate)
         return -value if negative else value
 
     @staticmethod
     def _extract_note_references(text: str) -> List[str]:
-        refs = re.findall(r"\d+", text)
+        refs = re.findall(r"\d+(?:\.\d+)?", text)
         return refs if len(refs) <= 10 else []
 
     @staticmethod
@@ -141,7 +154,7 @@ class TableProcessor:
         meaningful = [cell for cell in unique_cells if self._normalize_text(cell.get("text", ""))]
         if not meaningful:
             return 0.0
-        numeric = sum(1 for cell in meaningful if self._is_numeric_text(self._normalize_text(cell["text"])))
+        numeric = sum(1 for cell in meaningful if self._is_numeric_text(self._normalize_text(cell.get("text", ""))))
         return numeric / len(meaningful)
 
     def _unroll_grid(self) -> List[List[Optional[Dict[str, Any]]]]:
@@ -180,21 +193,22 @@ class TableProcessor:
                 colspan = self._safe_int(cell_tag.get("colspan"), 1)
                 raw_text = cell_tag.get_text("", strip=False)
                 text = self._normalize_text(raw_text)
-                is_header = (
-                    cell_tag.name == "th"
-                    or cell_tag.find_parent("thead") is not None
-                    or "th" in {cls.lower() for cls in cell_tag.get("class", [])}
-                )
+                class_names = cell_tag.get("class", [])
+                if isinstance(class_names, str):
+                    class_names = [class_names]
                 cell_obj = {
                     "origin_row": row_idx,
                     "origin_col": col_idx,
                     "td_index": td_idx,
-                    "start_col": col_idx,
                     "rowspan": rowspan,
                     "colspan": colspan,
                     "raw_text": raw_text,
                     "text": text,
-                    "is_header": is_header,
+                    "is_header": (
+                        cell_tag.name == "th"
+                        or cell_tag.find_parent("thead") is not None
+                        or any(cls.lower() == "th" for cls in class_names)
+                    ),
                     "source_html": str(cell_tag),
                 }
 
@@ -218,35 +232,41 @@ class TableProcessor:
         return grid
 
     def _find_header_rows(self, grid: List[List[Optional[Dict[str, Any]]]]) -> List[int]:
-        explicit_header_rows = []
+        explicit_rows = []
         for row_idx, row in enumerate(grid):
             unique_cells = self._unique_cells_in_row(row)
             if unique_cells and all(cell.get("is_header") for cell in unique_cells):
-                explicit_header_rows.append(row_idx)
+                explicit_rows.append(row_idx)
+        if explicit_rows:
+            return list(range(min(explicit_rows), max(explicit_rows) + 1))
 
-        if explicit_header_rows:
-            start = min(explicit_header_rows)
-            end = max(explicit_header_rows)
-            return list(range(start, end + 1))
-
-        # th가 없는 경우: 상위 행에서 헤더 키워드 + 낮은 숫자밀도를 함께 충족할 때만 헤더로 간주
         header_rows: List[int] = []
         for row_idx, row in enumerate(grid[:4]):
-            unique_cells = self._unique_cells_in_row(row)
+            joined = " ".join(
+                self._normalize_text(cell.get("text", ""))
+                for cell in self._unique_cells_in_row(row)
+            )
             density = self._row_numeric_density(row)
-            joined = " ".join(self._normalize_text(cell.get("text", "")) for cell in unique_cells)
-            has_header_keyword = any(token in joined for token in self.HEADER_KEYWORDS)
-
-            if row_idx == 0 and (has_header_keyword or density < 0.15):
+            has_keyword = any(keyword in joined for keyword in self.HEADER_KEYWORDS)
+            if row_idx == 0 and (has_keyword or density < 0.15):
                 header_rows.append(row_idx)
-            elif has_header_keyword and density < 0.45:
+            elif has_keyword and density < 0.45:
                 header_rows.append(row_idx)
             else:
                 break
         return header_rows
 
+    def _make_column_key(self, header_path: List[str], col_idx: int) -> str:
+        if not header_path:
+            return f"col_{col_idx}"
+        joined = "__".join(self._normalize_text(part) for part in header_path if part)
+        joined = re.sub(r"[^\w가-힣]+", "_", joined, flags=re.UNICODE).strip("_").lower()
+        return joined or f"col_{col_idx}"
+
     def _build_column_headers(
-        self, grid: List[List[Optional[Dict[str, Any]]]], header_rows: List[int]
+        self,
+        grid: List[List[Optional[Dict[str, Any]]]],
+        header_rows: List[int],
     ) -> Dict[int, Dict[str, Any]]:
         col_info: Dict[int, Dict[str, Any]] = {}
         for col_idx in range(self.max_cols):
@@ -260,40 +280,37 @@ class TableProcessor:
                 text = self._normalize_text(cell.get("text", ""))
                 if text and text not in path:
                     path.append(text)
-
-            joined = " ".join(path)
+            header_joined = " ".join(path)
             col_info[col_idx] = {
                 "header_path": path,
-                "is_primary": col_idx == (self.max_cols - 1)
-                or any(token in joined for token in ("당기", "기말", "총계", "합계")),
+                "column_key": self._make_column_key(path, col_idx),
+                "is_note_column": any(keyword in header_joined for keyword in self.NOTE_COLUMN_KEYWORDS),
+                "is_label_column": any(keyword in header_joined for keyword in self.LABEL_COLUMN_KEYWORDS),
             }
         return col_info
 
     def _detect_label_column_index(
-        self, grid: List[List[Optional[Dict[str, Any]]]], col_headers: Dict[int, Dict[str, Any]], header_rows: List[int]
+        self,
+        grid: List[List[Optional[Dict[str, Any]]]],
+        col_headers: Dict[int, Dict[str, Any]],
+        header_rows: List[int],
     ) -> int:
-        # 1) 헤더 경로에 과목/구분이 명시되면 최우선 사용
         for col_idx in range(self.max_cols):
-            header_joined = " ".join(col_headers.get(col_idx, {}).get("header_path", []))
-            if any(token in header_joined for token in ("과목", "구분", "항목")):
+            if col_headers.get(col_idx, {}).get("is_label_column"):
                 return col_idx
 
-        # 2) 본문에서 텍스트 비중이 높은 열을 선택 (초반 열 우선)
-        header_set = set(header_rows)
+        header_row_set = set(header_rows)
         best_col = 0
         best_score = float("-inf")
-        scan_cols = min(self.max_cols, 4)
-        for col_idx in range(scan_cols):
+        for col_idx in range(min(self.max_cols, 4)):
             non_empty = 0
             text_like = 0
             numeric_like = 0
             for row_idx, row in enumerate(grid):
-                if row_idx in header_set:
+                if row_idx in header_row_set:
                     continue
                 cell = row[col_idx] if col_idx < len(row) else None
-                if not cell:
-                    continue
-                if (cell["origin_row"], cell["origin_col"]) != (row_idx, col_idx):
+                if not cell or (cell["origin_row"], cell["origin_col"]) != (row_idx, col_idx):
                     continue
                 text = self._normalize_text(cell.get("text", ""))
                 if not text:
@@ -303,65 +320,50 @@ class TableProcessor:
                     numeric_like += 1
                 else:
                     text_like += 1
-
             if non_empty == 0:
                 continue
-            ratio_text = text_like / non_empty
-            ratio_numeric = numeric_like / non_empty
-            # 텍스트 비율이 높고, 컬럼 인덱스가 앞쪽일수록 점수 가산
-            score = (ratio_text * 2.5) - (ratio_numeric * 2.0) - (col_idx * 0.15)
+            score = (text_like / non_empty) * 2.5 - (numeric_like / non_empty) * 2.0 - (col_idx * 0.15)
             if score > best_score:
                 best_score = score
                 best_col = col_idx
         return best_col
 
     def _is_row_empty(self, row: List[Optional[Dict[str, Any]]]) -> bool:
-        for cell in self._unique_cells_in_row(row):
-            if self._normalize_text(cell.get("text", "")):
-                return False
-        return True
+        return not any(self._normalize_text(cell.get("text", "")) for cell in self._unique_cells_in_row(row))
 
     def _is_section_header(self, row: List[Optional[Dict[str, Any]]], label_text: str) -> bool:
-        if not label_text:
+        stripped = self._normalize_text(label_text)
+        if not stripped:
             return False
-        stripped = label_text.strip()
         unique_cells = self._unique_cells_in_row(row)
-        non_empty_cells = [c for c in unique_cells if self._normalize_text(c.get("text", ""))]
-
+        non_empty = [cell for cell in unique_cells if self._normalize_text(cell.get("text", ""))]
         if unique_cells and unique_cells[0].get("colspan", 1) >= max(1, self.max_cols - 1):
             return True
-
-        if len(non_empty_cells) == 1 and self._row_numeric_density(row) == 0:
+        if len(non_empty) == 1 and self._row_numeric_density(row) == 0:
             return True
-
-        if re.match(r"^\[.*\]$|.*:$", stripped):
+        if stripped.endswith(":"):
             return True
-
-        return any(keyword in stripped for keyword in ("재무상태표", "손익계산서", "자본변동표"))
+        return False
 
     def _calculate_row_depth(self, raw_text: str) -> int:
         stripped = self._normalize_text(raw_text)
-        indent_score = self._leading_indent_score(raw_text)
-        depth = max(0, indent_score // 4)
-
+        depth = max(0, self._leading_indent_score(raw_text) // 4)
         if re.match(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.", stripped):
             return 0
         if re.match(r"^\d+\.", stripped):
-            return max(1, depth)
+            return max(1, depth or 1)
         if re.match(r"^[가-힣A-Za-z]\.", stripped):
-            return max(2, depth + 1)
-        if re.match(r"^\([0-9]+\)", stripped):
+            return max(1, depth or 1)
+        if re.match(r"^\(\d+\)", stripped):
             return max(2, depth + 1)
         if stripped.startswith("-"):
-            return max(1, depth + 1)
+            return max(2, depth + 1)
         return depth
 
     @staticmethod
     def _stabilize_row_depth(raw_depth: int, parent_stack: Dict[int, str]) -> int:
-        if raw_depth <= 0:
-            return 0
-        if not parent_stack:
-            return 0
+        if raw_depth <= 0 or not parent_stack:
+            return 0 if raw_depth <= 0 else min(raw_depth, 1)
         max_existing = max(parent_stack.keys())
         stabilized = min(raw_depth, max_existing + 1)
         while stabilized > 0 and (stabilized - 1) not in parent_stack:
@@ -378,7 +380,9 @@ class TableProcessor:
         return text.strip()
 
     def _build_row_hierarchy(
-        self, grid: List[List[Optional[Dict[str, Any]]]], header_rows: List[int]
+        self,
+        grid: List[List[Optional[Dict[str, Any]]]],
+        header_rows: List[int],
     ) -> Tuple[Dict[int, TableRow], List[TableRow]]:
         header_row_set = set(header_rows)
         row_map: Dict[int, TableRow] = {}
@@ -392,19 +396,17 @@ class TableProcessor:
             label_cell = row[self.label_col_idx] if self.label_col_idx < len(row) else None
             if label_cell and (label_cell["origin_row"], label_cell["origin_col"]) != (row_idx, self.label_col_idx):
                 label_cell = None
-
             if not label_cell or not self._normalize_text(label_cell.get("text", "")):
-                for cell in self._unique_cells_in_row(row):
-                    if self._normalize_text(cell.get("text", "")):
-                        label_cell = cell
-                        break
-
+                label_cell = next(
+                    (cell for cell in self._unique_cells_in_row(row) if self._normalize_text(cell.get("text", ""))),
+                    None,
+                )
             if not label_cell:
                 continue
 
-            raw_label_text = label_cell.get("text", "")
-            raw_label_with_indent = label_cell.get("raw_text", raw_label_text)
-            is_section_header = self._is_section_header(row, raw_label_text)
+            raw_label = label_cell.get("text", "")
+            raw_label_with_indent = label_cell.get("raw_text", raw_label)
+            is_section_header = self._is_section_header(row, raw_label)
             if is_section_header:
                 row_depth = 0
             else:
@@ -417,8 +419,8 @@ class TableProcessor:
                 row_id=row_id,
                 table_id=self.table_id,
                 row_index=row_idx,
-                raw_label=raw_label_text,
-                normalized_label=self._normalize_label(raw_label_text),
+                raw_label=raw_label,
+                normalized_label=self._normalize_label(raw_label),
                 row_depth=row_depth,
                 parent_row_id=parent_row_id,
                 is_section_header=is_section_header,
@@ -433,16 +435,17 @@ class TableProcessor:
 
         return row_map, rows
 
-    def _collect_table_context_text(self) -> str:
-        return " ".join(chunk for chunk in (self.context_before, self.block.section_title or "") if chunk)
-
     def _extract_table_title_unit_years(
-        self, grid: List[List[Optional[Dict[str, Any]]]], col_headers: Dict[int, Dict[str, Any]]
+        self,
+        grid: List[List[Optional[Dict[str, Any]]]],
+        col_headers: Dict[int, Dict[str, Any]],
     ) -> Tuple[Optional[str], Optional[str], List[int]]:
-        # 제목 추론은 표 상단 + 직전 문맥 위주로 제한하여 인접 섹션 오염 방지
-        context_text = " ".join(part for part in (self.context_before, self.block.section_title or "") if part)
-        candidate_text = context_text
-        top_rows_texts: List[str] = []
+        context_lines = [
+            self._normalize_text(line)
+            for line in (self.context_before or "").splitlines()
+            if self._normalize_text(line)
+        ]
+        top_rows = []
         for row in grid[:4]:
             row_text = " ".join(
                 self._normalize_text(cell.get("text", ""))
@@ -450,30 +453,36 @@ class TableProcessor:
                 if self._normalize_text(cell.get("text", ""))
             )
             if row_text:
-                top_rows_texts.append(row_text)
-                candidate_text += f"\n{row_text}"
+                top_rows.append(row_text)
+        candidate_text = "\n".join(context_lines[-6:] + top_rows)
+        compact = self._compact_text(candidate_text)
 
         title = None
-        title_source = "\n".join(top_rows_texts) + "\n" + context_text
-        title_source_compact = re.sub(r"\s+", "", title_source)
         for keyword in self.STATEMENT_TYPE_MAP:
-            if keyword in title_source_compact:
+            if keyword in compact:
                 title = keyword
                 break
 
-        unit_match = re.search(r"\(단위\s*[:：]\s*([^)]+)\)", candidate_text)
-        unit = unit_match.group(1).strip() if unit_match else None
+        if title is None:
+            for line in reversed(context_lines[-4:]):
+                line_compact = self._compact_text(line)
+                if "단위" in line_compact:
+                    continue
+                if len(line) <= 80:
+                    title = line
+                    break
 
-        year_tokens = re.findall(r"(19\d{2}|20\d{2})년?", candidate_text)
+        unit_match = re.search(r"\(\s*단위\s*[:：]?\s*([^)]+)\)", candidate_text)
+        unit = self._normalize_text(unit_match.group(1)) if unit_match else None
+
+        year_tokens = re.findall(r"(19\d{2}|20\d{2})", candidate_text)
         for col_info in col_headers.values():
             joined = " ".join(col_info.get("header_path", []))
-            year_tokens.extend(re.findall(r"(19\d{2}|20\d{2})년?", joined))
-        year_candidates = sorted({int(token) for token in year_tokens})
-        return title, unit, year_candidates
+            year_tokens.extend(re.findall(r"(19\d{2}|20\d{2})", joined))
+        years = sorted({int(token) for token in year_tokens})
+        return title, unit, years
 
-    def _has_numeric_body(
-        self, grid: List[List[Optional[Dict[str, Any]]]], header_rows: List[int]
-    ) -> bool:
+    def _has_numeric_body(self, grid: List[List[Optional[Dict[str, Any]]]], header_rows: List[int]) -> bool:
         header_set = set(header_rows)
         numeric_cells = 0
         text_cells = 0
@@ -487,50 +496,76 @@ class TableProcessor:
                 text_cells += 1
                 if self._is_numeric_text(text):
                     numeric_cells += 1
-        if text_cells == 0:
-            return False
-        return (numeric_cells / text_cells) >= 0.25
+        return text_cells > 0 and (numeric_cells / text_cells) >= 0.25
 
-    def _classify_table_role(
-        self,
-        grid: List[List[Optional[Dict[str, Any]]]],
-        header_rows: List[int],
-        title: Optional[str],
-    ) -> str:
+    def _is_single_cell_narrative(self, grid: List[List[Optional[Dict[str, Any]]]]) -> bool:
+        if len(grid) != 1:
+            return False
+        unique = self._unique_cells_in_row(grid[0])
+        return len(unique) == 1 and len(self._normalize_text(unique[0].get("text", ""))) >= 60
+
+    def _looks_like_cover_period_table(self, grid: List[List[Optional[Dict[str, Any]]]]) -> bool:
+        text = " ".join(
+            self._normalize_text(cell.get("text", ""))
+            for row in grid[:4]
+            for cell in self._unique_cells_in_row(row)
+        )
+        compact = self._compact_text(text)
+        return bool(re.search(r"제\d+기", compact) and re.search(r"(19|20)\d{2}년", text))
+
+    def _classify_table(self, grid: List[List[Optional[Dict[str, Any]]]], title: Optional[str]) -> Tuple[str, Optional[str]]:
         table = self.soup.find("table")
-        class_names = []
+        class_names: List[str] = []
         if table:
             classes = table.get("class", [])
             if isinstance(classes, str):
                 classes = [classes]
             class_names = [cls.lower() for cls in classes]
 
-        context_text = self._collect_table_context_text()
-        header_text = " ".join(
-            " ".join(self._normalize_text(cell.get("text", "")) for cell in self._unique_cells_in_row(grid[row_idx]))
-            for row_idx in header_rows
-            if row_idx < len(grid)
-        )
-        signal_text = " ".join(chunk for chunk in (context_text, header_text, title or "") if chunk)
-        in_internal_section = self.block.section_type == "internal_control_opinion"
-        has_internal_keyword = any(keyword in signal_text for keyword in self.INTERNAL_CONTROL_KEYWORDS)
-        has_financial_keyword = any(keyword in signal_text for keyword in self.FINANCIAL_KEYWORDS)
+        context_text = " ".join(part for part in (self.context_before, self.block.section_title or "", title or "") if part)
+        signal_text = self._compact_text(context_text)
+        numeric_body = self._has_numeric_body(grid, self._find_header_rows(grid))
+        single_cell_narrative = self._is_single_cell_narrative(grid)
 
-        if in_internal_section:
-            return "internal_control_table"
-        if has_internal_keyword and not has_financial_keyword:
-            return "internal_control_table"
+        if self.block.section_type and self.block.section_type.startswith("internal_control"):
+            if numeric_body:
+                subrole = "internal_control_schedule"
+            elif single_cell_narrative:
+                subrole = "internal_control_notice"
+            else:
+                subrole = "internal_control_cover"
+            return "internal_control_table", subrole
 
-        if has_financial_keyword and self._has_numeric_body(grid, header_rows):
-            return "financial_table"
+        if self.block.section_type and self.block.section_type.startswith("external_audit"):
+            return "unknown_table", "external_audit_table"
 
-        if "nb" in class_names and not self._has_numeric_body(grid, header_rows):
-            return "cover_table"
+        if title and title in self.STATEMENT_TYPE_MAP:
+            return "financial_table", "primary_statement"
 
-        if not header_rows and not self._has_numeric_body(grid, header_rows):
-            return "cover_table"
+        if any(keyword in signal_text for keyword in map(self._compact_text, self.FINANCIAL_KEYWORDS)) and numeric_body:
+            if self.block.section_type == "attached_financial_statements":
+                return "financial_table", "primary_statement"
 
-        return "unknown_table"
+        if self.block.section_type in {"notes", "note_section", "contingent_liabilities_and_commitments", "subsequent_events"}:
+            if single_cell_narrative:
+                return "unknown_table", "narrative_notice"
+            if numeric_body:
+                return "unknown_table", "note_quant_table"
+            return "unknown_table", "note_layout_table"
+
+        if self.block.section_type == "cover" or ("nb" in class_names and not numeric_body):
+            if self._looks_like_cover_period_table(grid):
+                return "cover_table", "cover_period"
+            if single_cell_narrative:
+                return "cover_table", "cover_notice"
+            return "cover_table", "cover_layout"
+
+        if single_cell_narrative:
+            return "unknown_table", "narrative_notice"
+
+        if numeric_body:
+            return "unknown_table", "quant_table"
+        return "unknown_table", "layout_table"
 
     def _infer_statement_type(self, title: Optional[str]) -> Optional[str]:
         if not title:
@@ -540,39 +575,47 @@ class TableProcessor:
                 return statement_type
         return None
 
-    @staticmethod
-    def _infer_period(header_path: List[str]) -> Optional[str]:
+    def _infer_period(self, header_path: List[str]) -> Optional[str]:
         joined = " ".join(header_path)
-        compact = re.sub(r"\s+", "", joined)
-        year_match = re.search(r"(19\d{2}|20\d{2})년?", joined)
+        compact = self._compact_text(joined)
+        year_match = re.search(r"(19\d{2}|20\d{2})", joined)
         if year_match:
             return year_match.group(1)
-        for token in ("당기", "전기", "기말", "기초", "누적"):
-            if token in joined:
-                return token
-            if token in compact:
-                return token
-        if re.search(r"제\d+.*당.*기", compact):
+        if re.search(r"당.?기말", compact):
+            return "당기말"
+        if re.search(r"전.?기말", compact):
+            return "전기말"
+        if re.search(r"당.?기초", compact):
+            return "당기초"
+        if re.search(r"전.?기초", compact):
+            return "전기초"
+        if re.search(r"당.?기", compact):
             return "당기"
-        if re.search(r"제\d+.*전.*기", compact):
+        if re.search(r"전.?기", compact):
             return "전기"
+        for token in self.PERIOD_KEYWORDS:
+            if token in joined or self._compact_text(token) in compact:
+                return token
         return None
 
-    @staticmethod
-    def _period_group_key(header_path: List[str], period: Optional[str], col_index: int) -> str:
-        if period:
-            return period
-        joined = " ".join(header_path)
-        key_match = re.search(r"(제\s*\d+\s*기|당기|전기|기말|기초)", joined)
-        if key_match:
-            return key_match.group(1).replace(" ", "")
-        return f"col_{col_index}"
+    def _infer_value_role(self, header_path: List[str], value_raw: str) -> Optional[str]:
+        header_joined = " ".join(header_path)
+        if "%" in header_joined or "%" in value_raw:
+            return "ratio"
+        if "주식수" in header_joined or header_joined.endswith("(주)") or "주" == header_joined.strip():
+            return "share_count"
+        if "시간" in header_joined:
+            return "hours"
+        if "명" in header_joined:
+            return "headcount"
+        return "amount"
 
     def _build_cells_and_values(
         self,
         grid: List[List[Optional[Dict[str, Any]]]],
         col_headers: Dict[int, Dict[str, Any]],
         row_map: Dict[int, TableRow],
+        unit: Optional[str],
     ) -> Tuple[List[TableCell], List[TableValue]]:
         cells: List[TableCell] = []
         values: List[TableValue] = []
@@ -582,18 +625,16 @@ class TableProcessor:
             row_obj = row_map.get(row_idx)
             row_note_refs: List[str] = []
 
-            # 1) 노트 참조 컬럼 선집계
             for col_idx, cell in enumerate(row):
                 if not cell:
                     continue
                 origin = (cell["origin_row"], cell["origin_col"])
                 if origin != (row_idx, col_idx):
                     continue
-                header_path = col_headers.get(col_idx, {}).get("header_path", [])
-                if "주석" in " ".join(header_path):
+                header_info = col_headers.get(col_idx, {})
+                if header_info.get("is_note_column"):
                     row_note_refs.extend(self._extract_note_references(cell.get("text", "")))
 
-            # 2) cell/value 생성
             for col_idx, cell in enumerate(row):
                 if not cell:
                     continue
@@ -602,7 +643,8 @@ class TableProcessor:
                     continue
                 seen_cells.add(origin)
 
-                header_path = col_headers.get(col_idx, {}).get("header_path", [])
+                header_info = col_headers.get(col_idx, {})
+                header_path = header_info.get("header_path", [])
                 cell_id = f"{self.table_id}_c{origin[0]:04d}_{origin[1]:03d}"
                 cell_obj = TableCell(
                     cell_id=cell_id,
@@ -623,57 +665,48 @@ class TableProcessor:
 
                 if not row_obj or cell_obj.is_header or col_idx == self.label_col_idx:
                     continue
+                if header_info.get("is_note_column"):
+                    continue
 
                 value_raw = self._normalize_text(cell_obj.text)
-                header_joined = " ".join(header_path)
-                is_note_col = "주석" in header_joined
-                numeric_value = self._parse_numeric(value_raw)
-
-                if is_note_col:
-                    if row_note_refs:
-                        row_obj.metadata["note_reference_candidates"] = sorted(set(row_note_refs))
+                value_numeric = self._parse_numeric(value_raw)
+                if value_numeric is None:
                     continue
 
-                if numeric_value is None:
-                    continue
-
-                value_id = f"{self.table_id}_v{row_idx:04d}_{col_idx:03d}"
                 period = self._infer_period(header_path)
+                column_key = str(header_info.get("column_key", f"col_{col_idx}"))
                 values.append(
                     TableValue(
-                        value_id=value_id,
+                        value_id=f"{self.table_id}_v{row_idx:04d}_{col_idx:03d}",
                         table_id=self.table_id,
                         row_id=row_obj.row_id,
                         col_index=col_idx,
+                        column_key=column_key,
                         period=period,
+                        value_role=self._infer_value_role(header_path, value_raw),
                         value_raw=value_raw,
-                        value_numeric=numeric_value,
-                        unit=None,  # 테이블 단위는 process()에서 상위에서 일괄 주입
+                        value_numeric=value_numeric,
+                        unit=unit,
                         column_header_path=" > ".join(header_path),
                         is_primary_value=False,
                         note_reference_candidates=sorted(set(row_note_refs)),
                         metadata={
-                            "period_group_key": self._period_group_key(
-                                header_path=header_path,
-                                period=period,
-                                col_index=col_idx,
-                            )
+                            "period_group_key": period or column_key,
                         },
                     )
                 )
 
-        # 같은 행-기간 그룹 내 대표값(primary) 선정
+            if row_obj and row_note_refs:
+                row_obj.metadata["note_reference_candidates"] = sorted(set(row_note_refs))
+
         grouped: Dict[Tuple[str, str], List[TableValue]] = {}
         for value in values:
-            group_key = value.metadata.get("period_group_key", f"col_{value.col_index}")
-            grouped.setdefault((value.row_id, group_key), []).append(value)
-
-        for _, group_values in grouped.items():
+            grouped.setdefault((value.row_id, str(value.metadata.get("period_group_key"))), []).append(value)
+        for group_values in grouped.values():
             if len(group_values) == 1:
                 group_values[0].is_primary_value = True
                 continue
-            # 국내 재무제표에서 동일 기간 내 복수열이면 우측 열을 대표로 간주
-            primary = max(group_values, key=lambda item: item.col_index)
+            primary = max(group_values, key=lambda item: (item.col_index, item.value_role == "amount"))
             primary.is_primary_value = True
 
         return cells, values
@@ -688,12 +721,9 @@ class TableProcessor:
         self.label_col_idx = self._detect_label_column_index(raw_grid, col_headers, header_rows)
         row_map, rows = self._build_row_hierarchy(raw_grid, header_rows)
         title, unit, year_candidates = self._extract_table_title_unit_years(raw_grid, col_headers)
-        table_role = self._classify_table_role(raw_grid, header_rows, title)
+        table_role, table_subrole = self._classify_table(raw_grid, title)
         statement_type = self._infer_statement_type(title)
-        cells, values = self._build_cells_and_values(raw_grid, col_headers, row_map)
-
-        for value in values:
-            value.unit = unit
+        cells, values = self._build_cells_and_values(raw_grid, col_headers, row_map, unit)
 
         return NormalizedTable(
             table_id=self.table_id,
@@ -701,6 +731,7 @@ class TableProcessor:
             source_block_id=self.block.block_id,
             statement_type=statement_type,
             table_role=table_role,
+            table_subrole=table_subrole,
             title=title,
             unit=unit,
             year_candidates=year_candidates,
