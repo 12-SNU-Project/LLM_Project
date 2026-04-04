@@ -1,26 +1,24 @@
 from __future__ import annotations
 
-import re
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
 
-from models import (
-    FilingParseResult,
-    NormalizedTable,
-    TableRow,
-    TableValue,
-    TextChunk,
-)
-from parser import AuditReportParser, decode_html_file
-from table_processor import TableProcessor
+try:
+    from .models import FilingParseResult, NormalizedTable, TextChunk
+    from .parser import AuditReportParser, decode_html_file
+    from .table_processor import TableProcessor
+except ImportError:
+    from models import FilingParseResult, NormalizedTable, TextChunk
+    from parser import AuditReportParser, decode_html_file
+    from table_processor import TableProcessor
 
 
 class AuditReportPipeline:
     """HTML 감사보고서 -> 구조 IR -> RDB/VDB 파생 파이프라인."""
-
     TEXT_BLOCK_TYPES_FOR_CHUNK = {"paragraph", "footnote", "cover", "section_heading"}
 
     def parse_file(
@@ -35,29 +33,33 @@ class AuditReportPipeline:
 
         parser = AuditReportParser(html)
         blocks = parser.parse()
+        for block in blocks:
+            block.filing_id = filing_id
         sections = parser.build_sections(filing_id)
         meta = parser.extract_document_meta(
             filing_id=filing_id,
             source_file=str(path),
             source_encoding=encoding,
         )
+
         if fiscal_year is not None:
             meta.fiscal_year = fiscal_year
         elif meta.fiscal_year is None:
-            inferred_year = self._extract_year_from_filename(path.name)
-            meta.fiscal_year = inferred_year
+            meta.fiscal_year = self._extract_year_from_filename(path.name)
 
         tables = self._build_tables(
             blocks=blocks,
             filing_id=filing_id,
             fiscal_year=meta.fiscal_year,
+            source_file=str(path),
         )
-        chunks = self._build_text_chunks(
+        text_chunks = self._build_text_chunks(
             blocks=blocks,
             tables=tables,
             filing_id=filing_id,
             fiscal_year=meta.fiscal_year,
             auditor_name=meta.auditor_name,
+            source_file=str(path),
         )
 
         return FilingParseResult(
@@ -65,7 +67,7 @@ class AuditReportPipeline:
             blocks=blocks,
             sections=sections,
             tables=tables,
-            text_chunks=chunks,
+            text_chunks=text_chunks,
         )
 
     @staticmethod
@@ -75,7 +77,7 @@ class AuditReportPipeline:
 
     def _make_filing_id(self, path: Path) -> str:
         year = self._extract_year_from_filename(path.name) or "unknown"
-        stem = re.sub(r"[^0-9A-Za-z가-힣_]+", "_", path.stem)
+        stem = re.sub(r"[^0-9A-Za-z가-힣]+", "_", path.stem).strip("_")
         return f"{stem}_{year}"
 
     @staticmethod
@@ -97,58 +99,55 @@ class AuditReportPipeline:
         return "\n".join(collected)
 
     @staticmethod
-    def _extract_table_context_text(html_fragment: str, max_len: int = 280) -> str:
+    def _extract_table_context_text(html_fragment: str, max_len: int = 320) -> str:
         soup = BeautifulSoup(html_fragment, "html.parser")
         text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
         if not text:
             return ""
-        compact = re.sub(r"\s+", "", text)
-        # 표 제목/단위/기수 정보를 우선 context로 사용
-        keywords = ("재무상태표", "손익계산서", "포괄손익계산서", "자본변동표", "현금흐름표", "단위", "제 ")
-        if any(k in compact for k in keywords[:-1]) or "단위" in text or "제 " in text:
-            return text[:max_len]
-        return ""
+        return text[:max_len]
 
     def _build_tables(
         self,
         blocks,
         filing_id: str,
         fiscal_year: Optional[int],
+        source_file: Optional[str] = None,
     ) -> List[NormalizedTable]:
         tables: List[NormalizedTable] = []
         for idx, block in enumerate(blocks):
             if block.block_type != "table":
                 continue
-
-            context_before = self._collect_context(blocks, idx, direction=-1)
-            context_after = self._collect_context(blocks, idx, direction=1)
             processor = TableProcessor(
                 block=block,
                 filing_id=filing_id,
                 fiscal_year=fiscal_year,
-                context_before=context_before,
-                context_after=context_after,
+                context_before=self._collect_context(blocks, idx, direction=-1),
+                context_after=self._collect_context(blocks, idx, direction=1),
             )
-            normalized = processor.process()
-            if normalized:
-                tables.append(normalized)
+            table = processor.process()
+            if table:
+                table.page_start = block.page_index
+                table.page_end = block.page_index
+                table.source_file = source_file
+                tables.append(table)
         return tables
 
     @staticmethod
-    def _infer_topic_hint(text: str, section_type: Optional[str]) -> str:
-        if "핵심감사사항" in text:
-            return "key_audit_matters"
-        if "감사의견" in text:
-            return "audit_opinion"
-        if "내부회계관리제도" in text:
-            return "internal_control"
-        if "우발부채" in text or "약정사항" in text:
-            return "contingent_liabilities_and_commitments"
-        if "보고기간 후 사건" in text:
-            return "subsequent_events"
-        if "회계정책" in text:
-            return "accounting_policies"
-        return section_type or "general"
+    def _infer_topic_hint(section_type: Optional[str], section_title: Optional[str], text: str) -> str:
+        if section_type and section_type != "cover":
+            return section_type
+        compact = re.sub(r"\s+", "", text)
+        for keyword, topic in (
+            ("핵심감사사항", "key_audit_matters"),
+            ("감사의견", "audit_opinion"),
+            ("내부회계관리제도", "internal_control"),
+            ("우발부채", "contingent_liabilities_and_commitments"),
+            ("보고기간후사건", "subsequent_events"),
+            ("회계정책", "accounting_policies"),
+        ):
+            if keyword in compact:
+                return topic
+        return section_title or "general"
 
     @staticmethod
     def _nearest_table_id(
@@ -163,6 +162,40 @@ class AuditReportPipeline:
         closest_idx, closest_table_id = min(table_positions, key=lambda item: abs(item[0] - mid))
         return closest_table_id if abs(closest_idx - mid) <= max_distance else None
 
+    @staticmethod
+    def _split_chunk_text(text: str, max_chars: int) -> List[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+
+        sentence_parts = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s+|(?<=요\.)\s+|\n+", text)
+        sentence_parts = [part.strip() for part in sentence_parts if part.strip()]
+        if not sentence_parts:
+            sentence_parts = [text]
+
+        chunks: List[str] = []
+        current = ""
+        for part in sentence_parts:
+            candidate = part if not current else f"{current} {part}"
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(part) <= max_chars:
+                current = part
+                continue
+            start = 0
+            while start < len(part):
+                chunks.append(part[start:start + max_chars].strip())
+                start += max_chars
+        if current:
+            chunks.append(current)
+        return [chunk for chunk in chunks if chunk]
+
     def _build_text_chunks(
         self,
         blocks,
@@ -170,6 +203,7 @@ class AuditReportPipeline:
         filing_id: str,
         fiscal_year: Optional[int],
         auditor_name: Optional[str],
+        source_file: Optional[str] = None,
         max_chars: int = 1200,
     ) -> List[TextChunk]:
         block_index = {block.block_id: idx for idx, block in enumerate(blocks)}
@@ -191,7 +225,7 @@ class AuditReportPipeline:
 
         def flush(end_idx: int) -> None:
             nonlocal current_texts, current_start_idx, current_section_id, current_section_type, current_section_title
-            if not current_texts or current_start_idx is None:
+            if current_start_idx is None or not current_texts:
                 return
             text = "\n".join(part for part in current_texts if part).strip()
             if not text:
@@ -201,38 +235,41 @@ class AuditReportPipeline:
 
             start_block = blocks[current_start_idx]
             end_block = blocks[end_idx]
-            topic_hint = self._infer_topic_hint(text=text, section_type=current_section_type)
             near_table_id = self._nearest_table_id(table_positions, current_start_idx, end_idx)
-            chunk_id = f"{filing_id}_ch{len(chunks):04d}"
-            chunks.append(
-                TextChunk(
-                    chunk_id=chunk_id,
-                    filing_id=filing_id,
-                    fiscal_year=fiscal_year,
-                    section_type=current_section_type,
-                    section_title=current_section_title,
-                    auditor_name=auditor_name,
-                    near_table_id=near_table_id,
-                    topic_hint=topic_hint,
-                    text=text,
-                    start_block_id=start_block.block_id,
-                    end_block_id=end_block.block_id,
-                    metadata={"section_id": current_section_id},
+            topic_hint = self._infer_topic_hint(current_section_type, current_section_title, text)
+            for chunk_text in self._split_chunk_text(text, max_chars=max_chars):
+                chunk_id = f"{filing_id}_ch{len(chunks):04d}"
+                chunks.append(
+                    TextChunk(
+                        chunk_id=chunk_id,
+                        filing_id=filing_id,
+                        fiscal_year=fiscal_year,
+                        section_id=current_section_id,
+                        section_type=current_section_type,
+                        section_title=current_section_title,
+                        auditor_name=auditor_name,
+                        near_table_id=near_table_id,
+                        topic_hint=topic_hint,
+                        text=chunk_text,
+                        start_block_id=start_block.block_id,
+                        end_block_id=end_block.block_id,
+                        page_start=start_block.page_index,
+                        page_end=end_block.page_index,
+                        source_file=source_file,
+                        metadata={},
+                    )
                 )
-            )
             current_texts = []
             current_start_idx = None
 
         for idx, block in enumerate(blocks):
-            if block.block_type not in self.TEXT_BLOCK_TYPES_FOR_CHUNK:
-                continue
-            if not block.text:
+            if block.block_type not in self.TEXT_BLOCK_TYPES_FOR_CHUNK or not block.text:
                 continue
 
+            heading_boundary = block.block_type == "section_heading" and current_texts
             section_changed = current_section_id is not None and block.section_id != current_section_id
-            current_size = sum(len(part) for part in current_texts)
-            oversized = current_texts and (current_size + len(block.text) > max_chars)
-            if section_changed or oversized:
+            oversized = current_texts and (sum(len(part) for part in current_texts) + len(block.text) > max_chars)
+            if heading_boundary or section_changed or oversized:
                 flush(idx - 1)
 
             if current_start_idx is None:
@@ -263,10 +300,32 @@ class AuditReportPipeline:
             }
         ]
 
+        blocks_payload = [
+            {
+                "block_id": block.block_id,
+                "filing_id": result.meta.filing_id,
+                "block_type": block.block_type,
+                "text": block.text,
+                "html_fragment": block.html_fragment,
+                "dom_path": block.dom_path,
+                "order_index": block.order_index,
+                "page_index": block.page_index,
+                "prev_block_id": block.prev_block_id,
+                "next_block_id": block.next_block_id,
+                "section_id": block.section_id,
+                "section_type": block.section_type,
+                "section_title": block.section_title,
+                "metadata_json": json.dumps(block.metadata, ensure_ascii=False),
+            }
+            for block in result.blocks
+        ]
+
         sections = [
             {
                 "section_id": section.section_id,
                 "filing_id": section.filing_id,
+                "parent_section_id": section.parent_section_id,
+                "section_level": section.section_level,
                 "section_type": section.section_type,
                 "section_title": section.section_title,
                 "start_block_id": section.start_block_id,
@@ -276,9 +335,9 @@ class AuditReportPipeline:
             for section in result.sections
         ]
 
-        tables_payload = []
-        table_rows_payload = []
-        table_values_payload = []
+        tables_payload: List[Dict[str, object]] = []
+        table_rows_payload: List[Dict[str, object]] = []
+        table_values_payload: List[Dict[str, object]] = []
 
         for table in result.tables:
             tables_payload.append(
@@ -289,10 +348,14 @@ class AuditReportPipeline:
                     "section_type": table.section_type,
                     "statement_type": table.statement_type,
                     "table_role": table.table_role,
+                    "table_subrole": table.table_subrole,
                     "title": table.title,
                     "unit": table.unit,
                     "year_candidates_json": json.dumps(table.year_candidates, ensure_ascii=False),
                     "source_block_id": table.source_block_id,
+                    "page_start": table.page_start,
+                    "page_end": table.page_end,
+                    "source_file": table.source_file,
                     "context_before": table.context_before,
                     "context_after": table.context_after,
                 }
@@ -323,7 +386,9 @@ class AuditReportPipeline:
                         "table_id": value.table_id,
                         "row_id": value.row_id,
                         "col_index": value.col_index,
+                        "column_key": value.column_key,
                         "period": value.period,
+                        "value_role": value.value_role,
                         "value_raw": value.value_raw,
                         "value_numeric": value.value_numeric,
                         "unit": value.unit,
@@ -335,6 +400,7 @@ class AuditReportPipeline:
 
         return {
             "filings": filings,
+            "blocks": blocks_payload,
             "sections": sections,
             "tables": tables_payload,
             "table_rows": table_rows_payload,
@@ -344,6 +410,7 @@ class AuditReportPipeline:
                     "chunk_id": chunk.chunk_id,
                     "filing_id": chunk.filing_id,
                     "fiscal_year": chunk.fiscal_year,
+                    "section_id": chunk.section_id,
                     "section_type": chunk.section_type,
                     "section_title": chunk.section_title,
                     "auditor_name": chunk.auditor_name,
@@ -352,6 +419,9 @@ class AuditReportPipeline:
                     "text": chunk.text,
                     "start_block_id": chunk.start_block_id,
                     "end_block_id": chunk.end_block_id,
+                    "page_start": chunk.page_start,
+                    "page_end": chunk.page_end,
+                    "source_file": chunk.source_file,
                 }
                 for chunk in result.text_chunks
             ],
@@ -379,6 +449,7 @@ class AuditReportPipeline:
             lines.append("")
             lines.append(f"### {table.table_id} | {table.title or 'Untitled'}")
             lines.append(f"- role: {table.table_role}")
+            lines.append(f"- subrole: {table.table_subrole}")
             lines.append(f"- statement_type: {table.statement_type}")
             lines.append(f"- unit: {table.unit}")
             lines.append(f"- years: {table.year_candidates}")
@@ -387,7 +458,8 @@ class AuditReportPipeline:
             for row in major_rows:
                 row_values = [value for value in table.values if value.row_id == row.row_id][:3]
                 preview = ", ".join(
-                    f"{value.period or value.col_index}: {value.value_raw}" for value in row_values
+                    f"{value.column_key} ({value.period or '-'}) = {value.value_raw}"
+                    for value in row_values
                 )
                 lines.append(f"- {row.normalized_label}: {preview}")
 
