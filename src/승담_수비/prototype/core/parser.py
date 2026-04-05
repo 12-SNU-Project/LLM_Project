@@ -11,9 +11,9 @@ except ImportError:
     from models import Block, DocumentMeta, Section
 
 try:
-    from ..utils.structure_first_utils import decode_html_file
+    from .html_io import decode_html_file
 except ImportError:
-    from utils.structure_first_utils import decode_html_file
+    from html_io import decode_html_file
 
 
 def _rule(

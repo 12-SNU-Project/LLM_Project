@@ -9,11 +9,13 @@ from bs4 import BeautifulSoup
 
 try:
     from .models import FilingParseResult, NormalizedTable, TextChunk
-    from .parser import AuditReportParser, decode_html_file
+    from .html_io import decode_html_file
+    from .parser import AuditReportParser
     from .table_processor import TableProcessor
 except ImportError:
     from models import FilingParseResult, NormalizedTable, TextChunk
-    from parser import AuditReportParser, decode_html_file
+    from html_io import decode_html_file
+    from parser import AuditReportParser
     from table_processor import TableProcessor
 
 
