@@ -79,6 +79,15 @@ def run() -> Dict[str, Any]:
                 f"{path.name}: internal_control_audit_report count != 1",
                 failures,
             )
+        if year == 2019:
+            # `2) 전기`처럼 이어지는 표도 앞선 요약재무정보 의미를 상속해야 한다.
+            has_summary_continuation = any(
+                table.semantic_table_type == "subsidiary_summary_financial_table"
+                and table.title == "2) 전기"
+                and any("Samsung Semiconductor, Inc." in (row.raw_label or "") for row in table.rows)
+                for table in result.tables
+            )
+            _check(has_summary_continuation, f"{path.name}: summary continuation table semantic mismatch", failures)
 
         parse_summary.append(
             {
@@ -182,6 +191,7 @@ def run() -> Dict[str, Any]:
             "clarification_needed": False,
             "expect_row_label_fragment": "Samsung Semiconductor, Inc. (SSI)",
             "expect_column_key_fragment": "매출",
+            "expect_semantic_table_type": "related_party_transaction_table",
         },
     ]
 
@@ -236,6 +246,14 @@ def run() -> Dict[str, Any]:
                 _check(
                     any(expected_column_key_fragment in (row.get("column_key") or "") for row in bundle["sql_results"]),
                     f"query `{case['question']}`: expected column key fragment missing",
+                    failures,
+                )
+
+            expected_semantic_table_type = case.get("expect_semantic_table_type")
+            if expected_semantic_table_type:
+                _check(
+                    any(row.get("semantic_table_type") == expected_semantic_table_type for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected semantic table type missing",
                     failures,
                 )
 
