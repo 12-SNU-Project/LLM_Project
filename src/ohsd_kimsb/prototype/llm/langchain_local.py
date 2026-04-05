@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class LocalLLMConfig:
     provider: str = "ollama"
-    model: str = "qwen3:4b"
+    model: str = "qwen3:8b"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.0
     timeout: int = 120
+
+
+@dataclass
+class LocalEmbeddingConfig:
+    provider: str = "ollama"
+    model: str = "qwen3-embedding:8b"
+    base_url: str = "http://localhost:11434"
 
 
 class LangChainLocalLLM:
@@ -78,3 +86,52 @@ class LangChainLocalLLM:
         if start < 0 or end < 0 or end <= start:
             raise ValueError("JSON object not found in LLM output")
         return json.loads(raw[start:end + 1])
+
+    @staticmethod
+    def runtime_available() -> bool:
+        return all(
+            importlib.util.find_spec(module) is not None
+            for module in ("langchain_core", "langchain_ollama")
+        )
+
+
+class LangChainLocalEmbedding:
+    def __init__(self, config: Optional[LocalEmbeddingConfig] = None) -> None:
+        self.config = config or LocalEmbeddingConfig()
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        embedding_model = self._create_embedding_model()
+        return [list(vector) for vector in embedding_model.embed_documents(texts)]
+
+    def embed_query(self, text: str) -> List[float]:
+        embedding_model = self._create_embedding_model()
+        return list(embedding_model.embed_query(text))
+
+    def to_chroma_embedding_function(self) -> Any:
+        # Chroma keeps the embedding boundary separate from the LLM path.
+        parent = self
+
+        class _EmbeddingFunction:
+            def __call__(self, input: List[str]) -> List[List[float]]:
+                return parent.embed_documents(list(input))
+
+        return _EmbeddingFunction()
+
+    def _create_embedding_model(self) -> Any:
+        if self.config.provider != "ollama":
+            raise RuntimeError(f"Unsupported local embedding provider: {self.config.provider}")
+        try:
+            from langchain_ollama import OllamaEmbeddings
+        except ImportError as exc:
+            raise RuntimeError(
+                "langchain_ollama 패키지가 필요합니다. "
+                "임베딩 사용 전 langchain-core/langchain-ollama를 설치하십시오."
+            ) from exc
+        return OllamaEmbeddings(
+            model=self.config.model,
+            base_url=self.config.base_url,
+        )
+
+    @staticmethod
+    def runtime_available() -> bool:
+        return importlib.util.find_spec("langchain_ollama") is not None
