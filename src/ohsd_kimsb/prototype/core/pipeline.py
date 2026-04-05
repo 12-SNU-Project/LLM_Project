@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -302,91 +301,33 @@ class AuditReportPipeline:
             }
         ]
 
-        blocks_payload = [
-            {
-                "block_id": block.block_id,
-                "filing_id": result.meta.filing_id,
-                "block_type": block.block_type,
-                "text": block.text,
-                "html_fragment": block.html_fragment,
-                "dom_path": block.dom_path,
-                "order_index": block.order_index,
-                "page_index": block.page_index,
-                "prev_block_id": block.prev_block_id,
-                "next_block_id": block.next_block_id,
-                "section_id": block.section_id,
-                "section_type": block.section_type,
-                "section_title": block.section_title,
-                "metadata_json": json.dumps(block.metadata, ensure_ascii=False),
-            }
-            for block in result.blocks
-        ]
-
-        sections = [
-            {
-                "section_id": section.section_id,
-                "filing_id": section.filing_id,
-                "parent_section_id": section.parent_section_id,
-                "section_level": section.section_level,
-                "section_type": section.section_type,
-                "section_title": section.section_title,
-                "start_block_id": section.start_block_id,
-                "end_block_id": section.end_block_id,
-                "order_index": section.order_index,
-            }
-            for section in result.sections
-        ]
-
-        tables_payload: List[Dict[str, object]] = []
-        table_rows_payload: List[Dict[str, object]] = []
-        table_values_payload: List[Dict[str, object]] = []
+        metric_facts_payload: List[Dict[str, object]] = []
 
         for table in result.tables:
-            tables_payload.append(
-                {
-                    "table_id": table.table_id,
-                    "filing_id": table.filing_id,
-                    "section_id": table.section_id,
-                    "section_type": table.section_type,
-                    "statement_type": table.statement_type,
-                    "table_role": table.table_role,
-                    "table_subrole": table.table_subrole,
-                    "title": table.title,
-                    "unit": table.unit,
-                    "year_candidates_json": json.dumps(table.year_candidates, ensure_ascii=False),
-                    "source_block_id": table.source_block_id,
-                    "page_start": table.page_start,
-                    "page_end": table.page_end,
-                    "source_file": table.source_file,
-                    "context_before": table.context_before,
-                    "context_after": table.context_after,
-                }
-            )
+            row_lookup = {row.row_id: row for row in table.rows}
 
-            for row in table.rows:
-                table_rows_payload.append(
+            for value in table.values:
+                row = row_lookup.get(value.row_id)
+                if row is None:
+                    continue
+                metric_facts_payload.append(
                     {
+                        "value_id": value.value_id,
+                        "filing_id": result.meta.filing_id,
+                        "fiscal_year": result.meta.fiscal_year,
+                        "table_id": table.table_id,
+                        "section_type": table.section_type,
+                        "statement_type": table.statement_type,
+                        "table_role": table.table_role,
+                        "table_subrole": table.table_subrole,
+                        "table_title": table.title,
+                        "table_unit": table.unit,
+                        "page_start": table.page_start,
+                        "page_end": table.page_end,
                         "row_id": row.row_id,
-                        "table_id": row.table_id,
                         "row_index": row.row_index,
                         "raw_label": row.raw_label,
                         "normalized_label": row.normalized_label,
-                        "row_depth": row.row_depth,
-                        "parent_row_id": row.parent_row_id,
-                        "is_section_header": row.is_section_header,
-                        "note_reference_json": json.dumps(
-                            row.metadata.get("note_reference_candidates", []),
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
-
-            for value in table.values:
-                table_values_payload.append(
-                    {
-                        "value_id": value.value_id,
-                        "table_id": value.table_id,
-                        "row_id": value.row_id,
                         "col_index": value.col_index,
                         "column_key": value.column_key,
                         "period": value.period,
@@ -396,31 +337,25 @@ class AuditReportPipeline:
                         "unit": value.unit,
                         "column_header_path": value.column_header_path,
                         "is_primary_value": value.is_primary_value,
-                        "note_reference_json": json.dumps(value.note_reference_candidates, ensure_ascii=False),
                     }
                 )
 
+        # Runtime SQLite is intentionally lean: table metrics go into one flat
+        # fact table. We still keep text_chunks so the exact Chroma source
+        # texts remain inspectable during debugging.
         return {
             "filings": filings,
-            "blocks": blocks_payload,
-            "sections": sections,
-            "tables": tables_payload,
-            "table_rows": table_rows_payload,
-            "table_values": table_values_payload,
+            "metric_facts": metric_facts_payload,
             "text_chunks": [
                 {
                     "chunk_id": chunk.chunk_id,
                     "filing_id": chunk.filing_id,
                     "fiscal_year": chunk.fiscal_year,
-                    "section_id": chunk.section_id,
                     "section_type": chunk.section_type,
                     "section_title": chunk.section_title,
-                    "auditor_name": chunk.auditor_name,
                     "near_table_id": chunk.near_table_id,
                     "topic_hint": chunk.topic_hint,
                     "text": chunk.text,
-                    "start_block_id": chunk.start_block_id,
-                    "end_block_id": chunk.end_block_id,
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
                     "source_file": chunk.source_file,

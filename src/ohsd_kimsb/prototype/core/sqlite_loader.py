@@ -11,15 +11,11 @@ except ImportError:
 
 
 class SQLiteLoader:
-    """파싱 결과를 SQLite로 적재하는 유틸리티."""
+    """Load the lean runtime payload into SQLite."""
 
     TABLE_ORDER = [
         "filings",
-        "blocks",
-        "sections",
-        "tables",
-        "table_rows",
-        "table_values",
+        "metric_facts",
         "text_chunks",
     ]
 
