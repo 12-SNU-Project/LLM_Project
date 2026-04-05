@@ -1,0 +1,568 @@
+"""감사보고서 RAG 시스템 (재설계)
+- 정규화 기반 정확한 매칭
+- 하드코딩 최소화
+- 깔끔한 검색 로직
+"""
+
+import sqlite3
+import chromadb
+from typing import List, Dict, Optional, Literal
+import json
+import re
+import requests
+
+
+class AuditReportRAG:
+    """감사보고서 RAG 시스템"""
+    
+    def __init__(
+        self,
+        sqlite_path: str = "./audit_data.db",
+        vector_path: str = "./chroma_sections",
+        llm_model: str = "qwen2.5:14b",
+        ollama_url: str = "http://localhost:11434"
+    ):
+        # SQLite 연결
+        self.sqlite_conn = sqlite3.connect(sqlite_path)
+        self.sqlite_conn.row_factory = sqlite3.Row
+        
+        # 벡터DB 연결
+        self.chroma_client = chromadb.PersistentClient(path=vector_path)
+        self.sections = self.chroma_client.get_or_create_collection("audit_text_chunks")
+        
+        # LLM 설정
+        self.llm_model = llm_model
+        self.ollama_url = ollama_url
+        
+        print(f"✓ SQLite 연결: {sqlite_path}")
+        print(f"✓ 벡터DB 연결: {vector_path}")
+        print(f"✓ LLM 모델: {llm_model} @ {ollama_url}")
+        print(f"  - 종속기업: {self._count_table('subsidiaries')}개")
+        print(f"  - 재무상태표: {self._count_table('balance_sheet')}개")
+        print(f"  - 섹션: {self.sections.count()}개")
+    
+    def _count_table(self, table_name: str) -> int:
+        """테이블 행 개수"""
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        return cursor.fetchone()[0]
+    
+    # ========== 정규화 함수 ==========
+    
+    def _normalize_text(self, text: str) -> str:
+        """질문/계정명 공통 정규화"""
+        if not text:
+            return ""
+        
+        text = str(text)
+        text = text.replace("\xa0", " ")  # Non-breaking space
+        text = text.strip().lower()
+        
+        # 년도 표현 통일
+        text = text.replace("년도", "년")
+        
+        # 공백 제거
+        text = re.sub(r"\s+", "", text)
+        
+        # 특수기호 제거
+        text = text.replace("(", "").replace(")", "")
+        text = text.replace(",", "")
+        
+        return text
+    
+    def _normalize_account_name(self, account_name: str) -> str:
+        """계정과목 정규화: 로마숫자/번호 제거"""
+        text = self._normalize_text(account_name)
+        
+        # 앞쪽 로마숫자/번호 제거
+        text = re.sub(r"^[ⅠⅡⅢⅣⅤⅥⅰⅱⅲⅳⅴⅵ0-9.\-]+", "", text)
+        
+        # 기호 제거
+        text = re.sub(r"[·•]", "", text)
+        
+        return text
+    
+    def _extract_year(self, query: str) -> Optional[int]:
+        """질문에서 연도 추출"""
+        q = self._normalize_text(query)
+        
+        # 2024년 / 2024
+        m = re.search(r"(20\d{2})년?", q)
+        if m:
+            return int(m.group(1))
+        
+        # 24년 / 24년도
+        m = re.search(r"(\d{2})년", q)
+        if m:
+            yy = int(m.group(1))
+            return 2000 + yy
+        
+        return None
+    
+    def _extract_account_keyword(self, query: str, year: Optional[int]) -> Optional[str]:
+        """DB 계정과목 목록에서 질문과 가장 잘 맞는 것 찾기"""
+        cursor = self.sqlite_conn.cursor()
+        
+        sql = "SELECT DISTINCT account_name FROM balance_sheet"
+        params = []
+        if year:
+            sql += " WHERE year = ?"
+            params.append(year)
+        
+        cursor.execute(sql, params)
+        accounts = [row[0] for row in cursor.fetchall()]
+        
+        # 질문 정규화
+        q_norm = self._normalize_text(query)
+        
+        candidates = []
+        for account in accounts:
+            acc_norm = self._normalize_account_name(account)
+            if not acc_norm:
+                continue
+            
+            # 정확 포함
+            if acc_norm in q_norm:
+                candidates.append(acc_norm)
+        
+        if not candidates:
+            return None
+        
+        # 가장 긴 것 = 더 구체적
+        candidates = sorted(set(candidates), key=len, reverse=True)
+        return candidates[0]
+    
+    # ========== 쿼리 분류 ==========
+    
+    def classify_query(self, query: str) -> Literal["numeric", "explanation", "hybrid"]:
+        """쿼리 유형 분류"""
+        query_lower = query.lower()
+        
+        # 설명/요약형 패턴 (우선순위 높음)
+        explanation_patterns = [
+            r"핵심감사사항|kam",
+            r"요약|설명|정리",
+            r"왜|어떻게|무엇|이유",
+            r"방법|정책|원칙",
+            r"회계처리|평가방법"
+        ]
+        
+        # 숫자/비교/조회형 패턴
+        numeric_patterns = [
+            r"얼마|금액|수치",
+            r"총|합계",
+            r"개수|몇개",
+            r"지분율|비율|퍼센트",
+            r"자산|부채|자본|매출|순이익",
+            r"찾아줘|조회|검색|리스트|목록"
+        ]
+        
+        # 혼합형 패턴
+        hybrid_patterns = [
+            r"(상위|top).*(설명|사업|업종)",
+            r"(회사|기업).*(어떤|무슨|사업)",
+            r"비교.*설명"
+        ]
+        
+        # 순서: hybrid → explanation → numeric
+        if any(re.search(p, query_lower) for p in hybrid_patterns):
+            return "hybrid"
+        elif any(re.search(p, query_lower) for p in explanation_patterns):
+            return "explanation"
+        elif any(re.search(p, query_lower) for p in numeric_patterns):
+            return "numeric"
+        else:
+            # 기본값: 설명형 (벡터 검색)
+            return "explanation"
+    
+    # ========== SQLite 쿼리 ==========
+    
+    def query_sqlite(self, query: str) -> Dict:
+        """SQLite에서 데이터 조회"""
+        result = {
+            "source": "sqlite",
+            "data": [],
+            "query_type": None
+        }
+        
+        year = self._extract_year(query)
+        
+        company_match = re.search(r"Samsung [A-Za-z\s&\-().]+|삼성[가-힣]+", query)
+        company_name = company_match.group(0) if company_match else None
+        
+        # 라우팅: 종속기업 우선
+        if "종속기업" in query or "관계기업" in query or company_name:
+            result["query_type"] = "subsidiaries"
+            result["data"] = self._query_subsidiaries(year, company_name, query)
+        else:
+            # 계정과목 추출 시도
+            target_account = self._extract_account_keyword(query, year)
+            if target_account:
+                result["query_type"] = "balance_sheet"
+                result["data"] = self._query_balance_sheet(year, query)
+        
+        return result
+    
+    def _query_subsidiaries(self, year: Optional[int], company_name: Optional[str], query: str) -> List[Dict]:
+        """종속기업 데이터 조회"""
+        cursor = self.sqlite_conn.cursor()
+        
+        sql = "SELECT year, company_name, data_json FROM subsidiaries WHERE 1=1"
+        params = []
+        
+        if year:
+            sql += " AND year = ?"
+            params.append(year)
+        
+        if company_name:
+            sql += " AND company_name LIKE ?"
+            params.append(f"%{company_name}%")
+        
+        sql += " ORDER BY year DESC"
+        
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        
+        # 결과 변환
+        results = []
+        for row in rows:
+            data = json.loads(row["data_json"])
+            results.append({
+                "year": row["year"],
+                "company_name": row["company_name"],
+                **data
+            })
+        
+        # TOP N 추출 및 정렬
+        top_n_match = re.search(r'상위\s*(\d+)|top\s*(\d+)|(\d+)\s*개', query.lower())
+        if top_n_match:
+            n = int(top_n_match.group(1) or top_n_match.group(2) or top_n_match.group(3))
+            n = min(n, 50)
+            
+            # 자산으로 정렬
+            if "자산" in query or "규모" in query:
+                for item in results:
+                    if '자산' in item and item['자산']:
+                        try:
+                            # 정렬용으로만 숫자 변환 (쉼표 제거)
+                            asset_str = str(item['자산']).replace(',', '')
+                            item['_sort_value'] = int(asset_str)
+                        except:
+                            item['_sort_value'] = 0
+                    else:
+                        item['_sort_value'] = 0
+                
+                # 자산 있는 것만 필터링 후 정렬
+                results = [r for r in results if r.get('_sort_value', 0) > 0]
+                results.sort(key=lambda x: x['_sort_value'], reverse=True)
+                results = results[:n]
+            
+            # 매출로 정렬
+            elif "매출" in query:
+                for item in results:
+                    if '매출액' in item and item['매출액']:
+                        try:
+                            sales_str = str(item['매출액']).replace(',', '')
+                            item['_sort_value'] = int(sales_str)
+                        except:
+                            item['_sort_value'] = 0
+                    else:
+                        item['_sort_value'] = 0
+                
+                # 매출 있는 것만 필터링 후 정렬
+                results = [r for r in results if r.get('_sort_value', 0) > 0]
+                results.sort(key=lambda x: x['_sort_value'], reverse=True)
+                results = results[:n]
+            
+            else:
+                # 정렬 기준 없으면 그냥 상위 N개
+                results = results[:n]
+        
+        elif "개수" not in query and "몇 개" not in query:
+            results = results[:20]  # 기본 20개
+        
+        # 정렬용 임시 필드 제거
+        for item in results:
+            item.pop('_sort_value', None)
+        
+        return results
+    
+    def _query_balance_sheet(self, year: Optional[int], query: str) -> List[Dict]:
+        """재무상태표 데이터 조회 - 정규화 기반 정확 매칭"""
+        cursor = self.sqlite_conn.cursor()
+        
+        # 질문에서 계정과목 추출
+        target_account = self._extract_account_keyword(query, year)
+        if not target_account:
+            return []
+        
+        # DB 조회
+        sql = "SELECT year, account_name, data_json FROM balance_sheet WHERE 1=1"
+        params = []
+        if year:
+            sql += " AND year = ?"
+            params.append(year)
+        
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        
+        # 정규화 매칭
+        results = []
+        for row in rows:
+            db_account_raw = row["account_name"]
+            db_account_norm = self._normalize_account_name(db_account_raw)
+            
+            # 정확 매칭만
+            if db_account_norm != target_account:
+                continue
+            
+            data = json.loads(row["data_json"])
+            
+            results.append({
+                "year": row["year"],
+                "account_name": data.get("account_name_display", db_account_raw),
+                "amount": data.get("amount", "N/A"),
+                **data
+            })
+        
+        return results
+    
+    # ========== 벡터DB 쿼리 ==========
+    
+    def query_vector(self, query: str, top_k: int = 10) -> Dict:
+        """벡터DB에서 관련 섹션 검색"""
+        # 공통 연도 추출 함수 사용
+        year = self._extract_year(query)
+        where_filter = {"year": year} if year else None
+        
+        # 벡터 검색은 원본 질문 사용 (정규화 X)
+        results = self.sections.query(
+            query_texts=[query],
+            n_results=top_k,
+            where=where_filter
+        )
+        
+        sections = []
+        for i in range(len(results["ids"][0])):
+            sections.append({
+                "section_title": results["metadatas"][0][i]["section_title"],
+                "year": results["metadatas"][0][i]["year"],
+                "text": results["documents"][0][i][:1000],
+                "distance": results["distances"][0][i]
+            })
+        
+        return {
+            "source": "vector",
+            "data": sections
+        }
+    
+    # ========== 혼합 쿼리 ==========
+    
+    def query_hybrid(self, query: str) -> Dict:
+        """SQLite + 벡터DB 조회"""
+        sqlite_result = self.query_sqlite(query)
+        vector_result = self.query_vector(query, top_k=3)
+        
+        return {
+            "source": "hybrid",
+            "sqlite": sqlite_result,
+            "vector": vector_result
+        }
+    
+    # ========== LLM 답변 생성 ==========
+    
+    def _prepare_context(self, result: Dict) -> str:
+        """조회 결과를 LLM용 컨텍스트로 변환"""
+        context_parts = []
+        
+        if result["source"] == "sqlite":
+            context_parts.append("=== 데이터베이스 조회 결과 ===")
+            
+            for item in result["data"][:20]:
+                if result["query_type"] == "subsidiaries":
+                    line = f"- {item['company_name']} ({item['year']}년)"
+                    for key, value in item.items():
+                        if key not in ["year", "company_name"] and value:
+                            line += f", {key}: {value}"
+                    context_parts.append(line)
+                
+                elif result["query_type"] == "balance_sheet":
+                    amount = item.get("amount", "N/A")
+                    if amount != "N/A":
+                        try:
+                            amount_int = int(amount)
+                            line = f"- {item['account_name']}: {amount_int:,}백만원"
+                        except:
+                            line = f"- {item['account_name']}: {amount}백만원"
+                    else:
+                        line = f"- {item['account_name']}: {amount}"
+                    context_parts.append(line)
+        
+        elif result["source"] == "vector":
+            context_parts.append("=== 감사보고서 관련 섹션 ===")
+            for section in result["data"][:3]:
+                context_parts.append(f"\n[{section['year']}년 - {section['section_title']}]")
+                context_parts.append(section["text"][:500])
+        
+        else:  # hybrid
+            if result["sqlite"]["data"]:
+                context_parts.append("=== 데이터베이스 조회 결과 ===")
+                for item in result["sqlite"]["data"][:10]:
+                    context_parts.append(f"- {item.get('company_name', item.get('account_name', 'N/A'))}")
+            
+            if result["vector"]["data"]:
+                context_parts.append("\n=== 감사보고서 관련 섹션 ===")
+                for section in result["vector"]["data"][:2]:
+                    context_parts.append(f"\n[{section['year']}년 - {section['section_title']}]")
+                    context_parts.append(section["text"][:300])
+        
+        return "\n".join(context_parts)
+    
+    def _generate_llm_answer(self, question: str, context: str) -> str:
+        """로컬 LLM으로 최종 답변 생성"""
+        prompt = f"""당신은 삼성전자 감사보고서 전문 분석가입니다. 주어진 데이터를 기반으로 질문에 정확하고 간결하게 답변하세요.
+
+**질문:** {question}
+
+**참고 데이터:**
+{context}
+
+**답변 지침:**
+- 주어진 데이터만을 근거로 답변하세요
+- 숫자는 정확하게 표기하세요 (단위: 백만원)
+- 간결하고 명확하게 답변하세요
+
+**답변:**"""
+        
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.llm_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": 200,  # 최대 200 토큰 (빠른 답변)
+                        "temperature": 0.3   # 더 일관된 답변
+                    }
+                },
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                return response.json()["response"]
+            else:
+                return f"[LLM 오류] 상태 코드: {response.status_code}"
+        
+        except requests.exceptions.ConnectionError:
+            return "[LLM 오류] Ollama 서버에 연결할 수 없습니다."
+        except Exception as e:
+            return f"[LLM 오류] {str(e)}"
+    
+    # ========== 통합 인터페이스 ==========
+    
+    def ask(self, question: str, use_llm: bool = True) -> str:
+        """질문에 대한 답변 생성"""
+        print(f"\n{'='*70}")
+        print(f"질문: {question}")
+        print(f"{'='*70}")
+        
+        # 쿼리 분류
+        query_type = self.classify_query(question)
+        print(f"쿼리 유형: {query_type}")
+        
+        # 데이터 조회
+        if query_type == "numeric":
+            result = self.query_sqlite(question)
+        elif query_type == "explanation":
+            result = self.query_vector(question)
+        else:
+            result = self.query_hybrid(question)
+        
+        # 조회 결과 확인
+        if result["source"] == "hybrid":
+            data_count = len(result["sqlite"]["data"]) + len(result["vector"]["data"])
+        else:
+            data_count = len(result.get("data", []))
+        
+        if data_count == 0:
+            return "관련 데이터를 찾지 못했습니다."
+        
+        # 컨텍스트 준비
+        context = self._prepare_context(result)
+        
+        # LLM 답변 생성
+        if use_llm:
+            # 숫자형 질문 + 정확히 1건 → 규칙 기반 답변
+            if (result["source"] == "sqlite" and 
+                result["query_type"] == "balance_sheet" and 
+                len(result["data"]) == 1):
+                
+                item = result["data"][0]
+                amount = item.get("amount", "N/A")
+                account = item.get("account_name", "")
+                year_val = item.get("year", "")
+                
+                if amount != "N/A":
+                    try:
+                        amount_int = int(amount)
+                        return f"{year_val}년 {account}은(는) {amount_int:,}백만원입니다."
+                    except:
+                        return f"{year_val}년 {account}은(는) {amount}백만원입니다."
+            
+            # 나머지는 LLM 사용
+            answer = self._generate_llm_answer(question, context)
+        else:
+            answer = context
+        
+        return answer
+    
+    def close(self):
+        """연결 종료"""
+        self.sqlite_conn.close()
+
+
+# ========== 실행 ==========
+
+if __name__ == "__main__":
+    
+    # RAG 시스템 초기화
+    rag = AuditReportRAG(
+        sqlite_path="/Users/parkhyeonseo/Documents/SNU12_ABS_Code/프로젝트/자연어처리/audit_data.db",
+        vector_path="/Users/parkhyeonseo/Documents/SNU12_ABS_Code/프로젝트/자연어처리/chroma_sections",
+        llm_model="qwen2.5:14b"
+    )
+    
+    print("\n" + "="*70)
+    print("RAG 시스템 (재설계 버전)")
+    print("="*70)
+    print("종료하려면 'exit' 또는 'quit' 입력")
+    print("="*70)
+    
+    # 대화형 루프
+    while True:
+        try:
+            question = input("\n질문: ").strip()
+            
+            if question.lower() in ["exit", "quit", "종료", "나가기"]:
+                print("\n시스템을 종료합니다.")
+                break
+            
+            if not question:
+                continue
+            
+            # 답변 생성
+            answer = rag.ask(question, use_llm=True)
+            
+            print(f"{'='*70}")
+            print(f"답변:")
+            print(f"{'='*70}")
+            print(answer)
+        
+        except KeyboardInterrupt:
+            print("\n\n시스템을 종료합니다.")
+            break
+        except Exception as e:
+            print(f"\n오류 발생: {e}")
+    
+    rag.close()
