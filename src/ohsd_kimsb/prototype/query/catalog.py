@@ -86,6 +86,20 @@ METRIC_DEFINITIONS: Dict[str, MetricDefinition] = {
         row_label_aliases=("자본총계", "총자본"),
         statement_types=("statement_of_financial_position",),
     ),
+    "equity_ratio": _metric(
+        "equity_ratio",
+        aliases=("자기자본비율", "자본비율", "equity ratio"),
+        row_label_aliases=("자기자본비율", "자본비율"),
+        statement_types=("statement_of_financial_position",),
+        topic_tags=("stability", "solvency"),
+    ),
+    "debt_ratio": _metric(
+        "debt_ratio",
+        aliases=("부채비율", "debt ratio"),
+        row_label_aliases=("부채비율",),
+        statement_types=("statement_of_financial_position",),
+        topic_tags=("stability", "solvency"),
+    ),
     "cash_and_cash_equivalents": _metric(
         "cash_and_cash_equivalents",
         aliases=("현금", "현금성자산", "현금및현금성자산", "cash"),
@@ -113,6 +127,9 @@ METRIC_ALIAS_TO_ID: Dict[str, str] = {}
 for metric_id, definition in METRIC_DEFINITIONS.items():
     for alias in (metric_id, *definition.aliases):
         METRIC_ALIAS_TO_ID[compact_token(alias)] = metric_id
+
+
+DERIVED_METRIC_IDS = {"equity_ratio", "debt_ratio"}
 
 
 SECTION_GROUPS: Dict[str, List[str]] = {

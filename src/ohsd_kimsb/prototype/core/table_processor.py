@@ -59,6 +59,12 @@ class TableProcessor:
         "related_party_balance_table": ("특수관계자에대한채권ㆍ채무등잔액", "특수관계자에대한채권채무등잔액"),
         "subsidiary_summary_financial_table": ("주요종속기업", "요약재무정보"),
     }
+    COMPANY_KIND_KEYWORDS = {
+        "associate": ("관계기업",),
+        "joint_venture": ("공동기업",),
+        "fund": ("투자신탁", "투자조합", "펀드", "fund", "l.p"),
+        "subsidiary": ("종속기업",),
+    }
 
     def __init__(
         self,
@@ -118,7 +124,7 @@ class TableProcessor:
         stripped = text.strip()
         if stripped in {"", "-", "N/A"}:
             return False
-        candidate = stripped.strip("()")
+        candidate = stripped.strip("()%")
         candidate = candidate.replace(" ", "")
         return bool(
             re.fullmatch(r"-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?", candidate)
@@ -130,7 +136,7 @@ class TableProcessor:
         if stripped in {"", "-", "N/A"}:
             return None
         negative = stripped.startswith("(") and stripped.endswith(")")
-        candidate = stripped.strip("()").replace(" ", "")
+        candidate = stripped.strip("()%").replace(" ", "")
         if not re.fullmatch(r"-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?", candidate):
             return None
         candidate = candidate.replace(",", "")
@@ -750,6 +756,30 @@ class TableProcessor:
         if any(keyword in context_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["subsidiary_status_table"]):
             return "subsidiary_status_table"
 
+        # 보험수리적 가정 표는 할인율/임금상승률 같은 % 값을 담으므로 별도 의미로 둔다.
+        if "보험수리적가정" in title_signal or "보험수리적가정" in context_signal:
+            return "actuarial_assumption_table"
+        if "할인율" in header_text and "미래임금상승률" in header_text:
+            return "actuarial_assumption_table"
+
+        # 무형자산 변동표는 개발비/영업권 같은 열과 기초·기말 장부가액 행의 조합이 핵심이다.
+        if "무형자산" in title_signal or "무형자산" in context_signal:
+            if any(token in header_text for token in ("개발비", "산업재산권", "영업권", "회원권")):
+                return "intangible_asset_rollforward_table"
+        if any(token in header_text for token in ("개발비", "산업재산권", "영업권")) and any(
+            token in self._compact_text(" ".join(row_labels)) for token in ("기초장부가액", "기말장부가액")
+        ):
+            return "intangible_asset_rollforward_table"
+
+        # 유형자산 변동표도 동일하게 열 축이 자산 종류를 뜻하므로 별도 의미로 구분한다.
+        if "유형자산" in title_signal or "유형자산" in context_signal:
+            if any(token in header_text for token in ("토지", "건물및구축물", "기계장치", "건설중인자산")):
+                return "property_plant_equipment_rollforward_table"
+        if any(token in header_text for token in ("토지", "건물및구축물", "기계장치", "건설중인자산")) and any(
+            token in self._compact_text(" ".join(row_labels)) for token in ("기초장부가액", "기말장부가액")
+        ):
+            return "property_plant_equipment_rollforward_table"
+
         if table_subrole == "note_quant_table":
             # 기업명 행이 다수면 일반 합계표보다 실체별 세부표일 가능성이 높다.
             if entity_like_rows >= 3 and ("기업명" in header_text or "구분" in header_text):
@@ -760,6 +790,46 @@ class TableProcessor:
         if table_subrole in {"narrative_notice", "cover_notice"}:
             return "narrative_notice_table"
         return "generic_numeric_table"
+
+    def _infer_company_kind(
+        self,
+        row: TableRow,
+        semantic_table_type: Optional[str],
+        title: Optional[str],
+    ) -> Optional[str]:
+        group_label = str(row.metadata.get("group_label") or "")
+        signal_text = " ".join(
+            part
+            for part in (
+                title or "",
+                self.block.section_title or "",
+                self.context_before or "",
+                self.context_after or "",
+                group_label,
+                row.raw_label,
+            )
+            if part
+        )
+        compact_signal = self._compact_text(signal_text)
+
+        for company_kind in ("fund", "associate", "joint_venture", "subsidiary"):
+            if any(self._compact_text(keyword) in compact_signal for keyword in self.COMPANY_KIND_KEYWORDS[company_kind]):
+                return company_kind  # 구체성이 높은 분류를 먼저 적용한다.
+
+        if semantic_table_type in {"subsidiary_status_table", "subsidiary_summary_financial_table"}:
+            return "subsidiary"
+        return None
+
+    def _annotate_row_company_kind(
+        self,
+        rows: List[TableRow],
+        semantic_table_type: Optional[str],
+        title: Optional[str],
+    ) -> None:
+        for row in rows:
+            company_kind = self._infer_company_kind(row=row, semantic_table_type=semantic_table_type, title=title)
+            if company_kind:
+                row.metadata["company_kind"] = company_kind  # 질의 해석과 SQL 필터에서 재사용한다.
 
     def _infer_statement_type(self, title: Optional[str]) -> Optional[str]:
         if not title:
@@ -803,6 +873,13 @@ class TableProcessor:
         if "명" in header_joined:
             return "headcount"
         return "amount"
+
+    @staticmethod
+    def _infer_value_unit(table_unit: Optional[str], header_path: List[str], value_raw: str) -> Optional[str]:
+        header_joined = " ".join(header_path)
+        if "%" in header_joined or "%" in value_raw:
+            return "percent"  # 비율형 수치는 금액 단위와 분리해서 저장한다.
+        return table_unit
 
     def _build_cells_and_values(
         self,
@@ -880,7 +957,7 @@ class TableProcessor:
                         value_role=self._infer_value_role(header_path, value_raw),
                         value_raw=value_raw,
                         value_numeric=value_numeric,
-                        unit=unit,
+                        unit=self._infer_value_unit(unit, header_path, value_raw),  # % 값은 percent로 별도 보존
                         column_header_path=" > ".join(header_path),
                         is_primary_value=False,
                         note_reference_candidates=sorted(set(row_note_refs)),
@@ -923,6 +1000,7 @@ class TableProcessor:
             col_headers=col_headers,
             rows=rows,
         )
+        self._annotate_row_company_kind(rows=rows, semantic_table_type=semantic_table_type, title=title)
         statement_type = self._infer_statement_type(title)
         cells, values = self._build_cells_and_values(raw_grid, col_headers, row_map, unit)
 

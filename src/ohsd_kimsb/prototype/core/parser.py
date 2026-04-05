@@ -387,7 +387,12 @@ class AuditReportParser:
             if prefix:
                 parts.append(("paragraph", prefix, {"synthetic": True, "split_part": "prefix"}))
             parts.append(("section_heading", title, {"synthetic": True, "split_part": "heading"}))
-            parts.extend(self._split_body_by_inner_headings(body))
+            body_parts = self._split_body_by_inner_headings(body)
+            if body_parts:
+                parts.extend(body_parts)
+            elif body:
+                # 제목과 본문이 같은 문단에 붙은 경우, 내부 소제목이 없어도 본문을 보존한다.
+                parts.append(("paragraph", body, {"synthetic": True, "split_part": "body"}))
             return parts
 
         for pattern in INLINE_PREFIX_PATTERNS:
@@ -397,7 +402,12 @@ class AuditReportParser:
             title = self._normalize_text(match.group("title")).rstrip(":：")
             body = self._normalize_text(match.groupdict().get("body", ""))
             parts = [("section_heading", title, {"synthetic": True, "split_part": "heading"})]
-            parts.extend(self._split_body_by_inner_headings(body))
+            body_parts = self._split_body_by_inner_headings(body)
+            if body_parts:
+                parts.extend(body_parts)
+            elif body:
+                # 하위 제목이 더 없더라도 제목 뒤 문단을 누락하지 않는다.
+                parts.append(("paragraph", body, {"synthetic": True, "split_part": "body"}))
             return parts
 
         generic_parts = self._split_body_by_inner_headings(normalized)

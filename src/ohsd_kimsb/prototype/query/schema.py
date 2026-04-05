@@ -10,6 +10,8 @@ class QueryIntent(str, Enum):
     TEXT_EXPLANATION = "text_explanation"
     METRIC_WITH_EXPLANATION = "metric_with_explanation"
     TREND_COMPARE = "trend_compare"
+    TABLE_CELL_LOOKUP = "table_cell_lookup"
+    COMPARISON_LIST_LOOKUP = "comparison_list_lookup"
 
 
 @dataclass
@@ -20,9 +22,16 @@ class QueryInterpretation:
     intent: QueryIntent
     metric_candidates: List[str] = field(default_factory=list)
     row_label_filters: List[str] = field(default_factory=list)
+    row_label_terms: List[str] = field(default_factory=list)
+    column_terms: List[str] = field(default_factory=list)
+    table_title_terms: List[str] = field(default_factory=list)
     year: Optional[int] = None
     year_range: Optional[Tuple[int, int]] = None
     year_window: Optional[int] = None
+    period: Optional[str] = None
+    comparison_operator: Optional[str] = None
+    threshold_value: Optional[float] = None
+    entity_scope: Optional[str] = None
     section_candidates: List[str] = field(default_factory=list)
     need_sql: bool = False
     need_vdb: bool = False
@@ -48,9 +57,16 @@ class QueryInterpretation:
             intent=QueryIntent(str(payload["intent"])),
             metric_candidates=[str(item) for item in payload.get("metric_candidates", [])],
             row_label_filters=[str(item) for item in payload.get("row_label_filters", [])],
+            row_label_terms=[str(item) for item in payload.get("row_label_terms", [])],
+            column_terms=[str(item) for item in payload.get("column_terms", [])],
+            table_title_terms=[str(item) for item in payload.get("table_title_terms", [])],
             year=int(payload["year"]) if payload.get("year") is not None else None,
             year_range=year_range,
             year_window=int(payload["year_window"]) if payload.get("year_window") is not None else None,
+            period=payload.get("period"),
+            comparison_operator=payload.get("comparison_operator"),
+            threshold_value=float(payload["threshold_value"]) if payload.get("threshold_value") is not None else None,
+            entity_scope=payload.get("entity_scope"),
             section_candidates=[str(item) for item in payload.get("section_candidates", [])],
             need_sql=bool(payload.get("need_sql", False)),
             need_vdb=bool(payload.get("need_vdb", False)),
@@ -90,6 +106,18 @@ INTERPRETATION_JSON_SCHEMA: Dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "row_label_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "column_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "table_title_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
         "year": {
             "type": ["integer", "null"],
         },
@@ -101,6 +129,18 @@ INTERPRETATION_JSON_SCHEMA: Dict[str, Any] = {
         },
         "year_window": {
             "type": ["integer", "null"],
+        },
+        "period": {
+            "type": ["string", "null"],
+        },
+        "comparison_operator": {
+            "type": ["string", "null"],
+        },
+        "threshold_value": {
+            "type": ["number", "null"],
+        },
+        "entity_scope": {
+            "type": ["string", "null"],
         },
         "section_candidates": {
             "type": "array",

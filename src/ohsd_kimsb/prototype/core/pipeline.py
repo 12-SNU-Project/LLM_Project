@@ -21,6 +21,14 @@ except ImportError:
 class AuditReportPipeline:
     """HTML 감사보고서 -> 구조 IR -> RDB/VDB 파생 파이프라인."""
     TEXT_BLOCK_TYPES_FOR_CHUNK = {"paragraph", "footnote", "cover", "section_heading"}
+    STRUCTURAL_SECTION_TYPES = {
+        "independent_auditor_report",
+        "attached_financial_statements",
+        "external_audit_activity",
+        "external_audit_target_work",
+        "external_audit_major_content",
+        "internal_control_opinion",
+    }
 
     def parse_file(
         self,
@@ -197,6 +205,23 @@ class AuditReportPipeline:
             chunks.append(current)
         return [chunk for chunk in chunks if chunk]
 
+    @classmethod
+    def _is_structural_chunk(
+        cls,
+        section_type: Optional[str],
+        section_title: Optional[str],
+        text: str,
+    ) -> bool:
+        normalized_text = re.sub(r"\s+", " ", (text or "")).strip()
+        normalized_title = re.sub(r"\s+", " ", (section_title or "")).strip()
+        if not normalized_text:
+            return False
+        if normalized_title and normalized_text == normalized_title:
+            return True  # 제목만 남은 청크는 구조 anchor로만 다룬다.
+        if section_type in cls.STRUCTURAL_SECTION_TYPES and len(normalized_text) <= 40:
+            return True
+        return False
+
     def _build_text_chunks(
         self,
         blocks,
@@ -240,6 +265,11 @@ class AuditReportPipeline:
             topic_hint = self._infer_topic_hint(current_section_type, current_section_title, text)
             for chunk_text in self._split_chunk_text(text, max_chars=max_chars):
                 chunk_id = f"{filing_id}_ch{len(chunks):04d}"
+                is_structural_chunk = self._is_structural_chunk(
+                    section_type=current_section_type,
+                    section_title=current_section_title,
+                    text=chunk_text,
+                )
                 chunks.append(
                     TextChunk(
                         chunk_id=chunk_id,
@@ -257,6 +287,7 @@ class AuditReportPipeline:
                         page_start=start_block.page_index,
                         page_end=end_block.page_index,
                         source_file=source_file,
+                        is_structural_chunk=is_structural_chunk,
                         metadata={},
                     )
                 )
@@ -330,6 +361,7 @@ class AuditReportPipeline:
                         "raw_label": row.raw_label,
                         "normalized_label": row.normalized_label,
                         "row_group_label": row.metadata.get("group_label"),
+                        "company_kind": row.metadata.get("company_kind"),
                         "col_index": value.col_index,
                         "column_key": value.column_key,
                         "period": value.period,
@@ -358,6 +390,7 @@ class AuditReportPipeline:
                     "near_table_id": chunk.near_table_id,
                     "topic_hint": chunk.topic_hint,
                     "text": chunk.text,
+                    "is_structural_chunk": chunk.is_structural_chunk,
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
                     "source_file": chunk.source_file,
@@ -409,7 +442,7 @@ class AuditReportPipeline:
             lines.append("")
             lines.append(f"### {chunk.chunk_id}")
             lines.append(
-                f"- section: {chunk.section_type} | {chunk.section_title} | topic={chunk.topic_hint}"
+                f"- section: {chunk.section_type} | {chunk.section_title} | topic={chunk.topic_hint} | structural={chunk.is_structural_chunk}"
             )
             lines.append(f"- near_table_id: {chunk.near_table_id}")
             lines.append(f"- text: {chunk.text[:260]}...")

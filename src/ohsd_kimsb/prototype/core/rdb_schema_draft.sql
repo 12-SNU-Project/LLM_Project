@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS metric_facts (
     raw_label                TEXT NOT NULL,
     normalized_label         TEXT,
     row_group_label          VARCHAR(120),
+    company_kind             VARCHAR(40),
     col_index                INTEGER NOT NULL,
     column_key               VARCHAR(160) NOT NULL,
     period                   VARCHAR(80),
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS text_chunks (
     near_table_id            VARCHAR(160),
     topic_hint               VARCHAR(120),
     text                     TEXT NOT NULL,
+    is_structural_chunk      BOOLEAN NOT NULL DEFAULT FALSE,
     page_start               INTEGER,
     page_end                 INTEGER,
     source_file              TEXT,
@@ -67,9 +69,11 @@ CREATE INDEX IF NOT EXISTS idx_metric_facts_role ON metric_facts(table_role, tab
 CREATE INDEX IF NOT EXISTS idx_metric_facts_semantic ON metric_facts(semantic_table_type);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_statement ON metric_facts(statement_type);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_label ON metric_facts(normalized_label, raw_label);
+CREATE INDEX IF NOT EXISTS idx_metric_facts_company_kind ON metric_facts(company_kind);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_column_key ON metric_facts(column_key);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_period ON metric_facts(period);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_primary ON metric_facts(is_primary_value);
 CREATE INDEX IF NOT EXISTS idx_text_chunks_filing ON text_chunks(filing_id);
 CREATE INDEX IF NOT EXISTS idx_text_chunks_section ON text_chunks(section_type);
+CREATE INDEX IF NOT EXISTS idx_text_chunks_structural ON text_chunks(is_structural_chunk);
 CREATE INDEX IF NOT EXISTS idx_text_chunks_page ON text_chunks(filing_id, page_start, page_end);

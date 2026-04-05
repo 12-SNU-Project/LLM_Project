@@ -157,6 +157,7 @@ class TextChunk:
     page_start: Optional[int] = None
     page_end: Optional[int] = None
     source_file: Optional[str] = None
+    is_structural_chunk: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
