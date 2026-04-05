@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -75,6 +76,7 @@ class ChromaVectorStore:
         return hits
 
     def _create_default_collection(self) -> Any:
+        self._disable_telemetry()
         try:
             import chromadb
         except ImportError as exc:
@@ -83,12 +85,17 @@ class ChromaVectorStore:
                 "ChromaVectorStore 사용 전 chromadb를 설치하십시오."
             ) from exc
 
+        settings = self._build_client_settings()
         if self.persist_directory:
             persist_path = Path(self.persist_directory)
             persist_path.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(path=str(persist_path))
+            client = self._create_client(
+                chromadb,
+                path=str(persist_path),
+                settings=settings,
+            )
         else:
-            client = chromadb.Client()
+            client = self._create_client(chromadb, settings=settings)
 
         if self.reset_collection:
             try:
@@ -104,3 +111,49 @@ class ChromaVectorStore:
             name=self.collection_name,
             embedding_function=embedding_function,
         )
+
+    def _build_client_settings(self) -> Optional[Any]:
+        try:
+            from chromadb.config import Settings
+        except Exception:
+            return None
+
+        # This project runs Chroma as a local embedded component, so
+        # anonymized telemetry only adds noise in offline environments.
+        return Settings(anonymized_telemetry=False)
+
+    @staticmethod
+    def _disable_telemetry() -> None:
+        # Keep local/offline runs quiet and deterministic even when the
+        # installed Chroma/PostHog versions disagree on telemetry hooks.
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
+        os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "FALSE")
+        os.environ.setdefault("POSTHOG_DISABLED", "1")
+        os.environ.setdefault("DISABLE_POSTHOG", "1")
+
+        try:
+            import posthog
+
+            posthog.disabled = True
+            if hasattr(posthog, "capture"):
+                posthog.capture = lambda *args, **kwargs: None
+        except Exception:
+            pass
+
+    def _create_client(
+        self,
+        chromadb: Any,
+        *,
+        path: Optional[str] = None,
+        settings: Optional[Any] = None,
+    ) -> Any:
+        if path:
+            try:
+                return chromadb.PersistentClient(path=path, settings=settings)
+            except TypeError:
+                return chromadb.PersistentClient(path=path)
+
+        try:
+            return chromadb.Client(settings=settings)
+        except TypeError:
+            return chromadb.Client()

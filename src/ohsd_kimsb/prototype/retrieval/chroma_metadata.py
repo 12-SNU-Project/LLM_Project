@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import json
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -29,23 +27,19 @@ class ChromaMetadataBuilder:
             near_table = table_by_id.get(chunk.near_table_id) if getattr(chunk, "near_table_id", None) else None
             topic_tags = self._extract_topic_tags(chunk=chunk, near_table=near_table)
             primary_topic_tag = topic_tags[0] if topic_tags else (chunk.topic_hint or chunk.section_type or "general")
+            # Keep Chroma metadata focused on retrieval filters and citations.
             metadata = {
                 "chunk_id": chunk.chunk_id,
                 "filing_id": chunk.filing_id,
                 "fiscal_year": chunk.fiscal_year,
-                "section_id": chunk.section_id,
                 "section_type": chunk.section_type or "unknown",
                 "section_title": chunk.section_title or "",
-                "auditor_name": chunk.auditor_name or "",
                 "near_table_id": chunk.near_table_id,
-                "near_statement_type": getattr(near_table, "statement_type", None),
                 "topic_hint": chunk.topic_hint or "",
                 "primary_topic_tag": primary_topic_tag,
                 "topic_tags": topic_tags,
-                "topic_tags_json": json.dumps(topic_tags, ensure_ascii=False),
                 "page_start": getattr(chunk, "page_start", None) or getattr(start_block, "page_index", None),
                 "page_end": getattr(chunk, "page_end", None) or getattr(end_block, "page_index", None),
-                "source_file": getattr(chunk, "source_file", None) or getattr(getattr(parse_result, "meta", None), "source_file", None),
             }
             documents.append(
                 ChromaChunkDocument(

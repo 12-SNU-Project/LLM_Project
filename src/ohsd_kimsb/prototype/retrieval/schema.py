@@ -22,11 +22,26 @@ class ChromaChunkDocument:
         if isinstance(topic_tags, list):
             metadata["topic_tags_json"] = json.dumps(topic_tags, ensure_ascii=False)
             metadata["topic_tags"] = ",".join(topic_tags)
+        metadata = self._sanitize_metadata(metadata)
         return {
             "id": self.document_id,
             "document": self.text,
             "metadata": metadata,
         }
+
+    @staticmethod
+    def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        clean: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            # Chroma metadata only accepts scalar primitives, so we drop None
+            # and coerce unexpected values to strings before upsert.
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                clean[key] = value
+                continue
+            clean[key] = str(value)
+        return clean
 
 
 @dataclass
