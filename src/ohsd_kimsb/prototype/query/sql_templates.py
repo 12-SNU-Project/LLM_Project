@@ -31,6 +31,7 @@ SELECT
     m.statement_type,
     m.table_role,
     m.table_subrole,
+    m.semantic_table_type,
     m.table_title,
     m.table_unit,
     m.page_start,
@@ -39,6 +40,7 @@ SELECT
     m.row_index,
     m.raw_label,
     m.normalized_label,
+    m.row_group_label,
     m.value_id,
     m.col_index,
     m.column_key,
@@ -93,7 +95,9 @@ JOIN filings f ON m.filing_id = f.filing_id
             self.BASE_SELECT
             + "\nWHERE "
             + "\n  AND ".join(where_clauses)
-            + "\nORDER BY CASE WHEN m.table_role = 'financial_table' THEN 0 ELSE 1 END, "
+            + "\nORDER BY "
+            + self._semantic_order_expr(interpretation)
+            + ", "
             + "f.fiscal_year DESC, m.table_id, m.row_index, m.col_index\nLIMIT ?"
         )
         params.append(interpretation.limit)
@@ -157,7 +161,9 @@ WITH target_years AS (
             + self.BASE_SELECT
             + "\nWHERE "
             + "\n  AND ".join(where_clauses)
-            + "\nORDER BY CASE WHEN m.table_role = 'financial_table' THEN 0 ELSE 1 END, "
+            + "\nORDER BY "
+            + self._semantic_order_expr(interpretation)
+            + ", "
             + "f.fiscal_year ASC, m.table_id, m.row_index, m.col_index"
         )
         return SQLQueryPlan(
@@ -212,6 +218,30 @@ WITH target_years AS (
                 params.extend(statement_types)
 
         return where_clauses, params
+
+    @staticmethod
+    def _semantic_order_expr(interpretation: QueryInterpretation) -> str:
+        if interpretation.row_label_filters:
+            # 특정 회사/거래 상대방이 들어오면 특수관계자 거래표를 먼저 본다.
+            return (
+                "CASE COALESCE(m.semantic_table_type, '') "
+                "WHEN 'related_party_transaction_table' THEN 0 "
+                "WHEN 'related_party_balance_table' THEN 1 "
+                "WHEN 'subsidiary_summary_financial_table' THEN 2 "
+                "WHEN 'subsidiary_status_table' THEN 3 "
+                "WHEN 'primary_financial_statement' THEN 4 "
+                "ELSE 9 END"
+            )
+
+        # 일반 metric 질의는 본표를 우선하고, 그 다음 보조 설명표를 본다.
+        return (
+            "CASE COALESCE(m.semantic_table_type, '') "
+            "WHEN 'primary_financial_statement' THEN 0 "
+            "WHEN 'subsidiary_summary_financial_table' THEN 1 "
+            "WHEN 'related_party_transaction_table' THEN 2 "
+            "WHEN 'related_party_balance_table' THEN 3 "
+            "ELSE 9 END"
+        )
 
     @staticmethod
     def _placeholders(values: List[Any]) -> str:
