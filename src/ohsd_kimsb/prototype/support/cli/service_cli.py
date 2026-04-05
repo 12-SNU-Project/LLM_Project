@@ -65,47 +65,156 @@ def _preview_text(text: str, limit: int = 140) -> str:
     return compact[: limit - 3] + "..."
 
 
+def _page_text(page_start: Any, page_end: Any) -> str:
+    if page_start is None and page_end is None:
+        return "-"
+    if page_end is None or page_start == page_end:
+        return f"p.{page_start}"
+    return f"p.{page_start}-{page_end}"
+
+
+def _safe_text(value: Any, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    return text or fallback
+
+
+INTENT_LABELS = {
+    "metric_lookup": "수치 조회",
+    "text_explanation": "설명 조회",
+    "metric_with_explanation": "수치 + 설명 조회",
+    "trend_compare": "추이 비교",
+    "table_cell_lookup": "표 셀 조회",
+    "comparison_list_lookup": "조건 목록 조회",
+}
+COMPARISON_LABELS = {
+    "lt": "미만",
+    "lte": "이하",
+    "gt": "초과",
+    "gte": "이상",
+}
+ENTITY_SCOPE_LABELS = {
+    "subsidiary": "종속기업",
+    "associate": "관계기업",
+    "joint_venture": "공동기업",
+}
+
+
+def _bool_text(value: Any) -> str:
+    return "예" if bool(value) else "아니오"
+
+
+def _print_interpretation(interpretation: Dict[str, Any], bundle: Dict[str, Any]) -> None:
+    sql_rows = len(bundle.get("sql_results") or [])
+    vector_hits = len(bundle.get("vector_hits") or [])
+    intent = _safe_text(interpretation.get("intent"))
+    intent_label = INTENT_LABELS.get(intent, intent)
+    clarification_needed = bool(interpretation.get("clarification_needed"))
+
+    print("질문 해석")
+    print(f"- 질문 유형: {intent_label} ({intent})")
+    print(f"- 추가 질문 필요: {_bool_text(clarification_needed)}")
+    print(
+        f"- 조회 경로: SQL {_bool_text(sql_rows > 0 or interpretation.get('need_sql'))} ({sql_rows}건) | "
+        f"VDB {_bool_text(vector_hits > 0 or interpretation.get('need_vdb'))} ({vector_hits}건)"
+    )
+
+    if clarification_needed and interpretation.get("clarification_reason"):
+        print(f"- 보완 필요 이유: {_safe_text(interpretation.get('clarification_reason'))}")
+
+    details: List[str] = []
+    if interpretation.get("metric_candidates"):
+        details.append(f"지표: {', '.join(map(str, interpretation['metric_candidates']))}")
+    if interpretation.get("row_label_filters"):
+        details.append(f"대상 행: {', '.join(map(str, interpretation['row_label_filters']))}")
+    if interpretation.get("row_label_terms"):
+        details.append(f"행 조건: {', '.join(map(str, interpretation['row_label_terms']))}")
+    if interpretation.get("column_terms"):
+        details.append(f"열 조건: {', '.join(map(str, interpretation['column_terms']))}")
+    if interpretation.get("table_title_terms"):
+        details.append(f"표 단서: {', '.join(map(str, interpretation['table_title_terms']))}")
+    if interpretation.get("section_candidates"):
+        details.append(f"본문 구간: {', '.join(map(str, interpretation['section_candidates']))}")
+    if interpretation.get("year") is not None:
+        details.append(f"연도: {interpretation['year']}")
+    if interpretation.get("year_range") is not None:
+        details.append(f"연도 범위: {interpretation['year_range']}")
+    if interpretation.get("period"):
+        details.append(f"기간 축: {interpretation['period']}")
+    if interpretation.get("comparison_operator"):
+        operator = COMPARISON_LABELS.get(str(interpretation["comparison_operator"]), interpretation["comparison_operator"])
+        details.append(f"비교 조건: {operator}")
+    if interpretation.get("threshold_value") is not None:
+        details.append(f"임계값: {interpretation['threshold_value']}")
+    if interpretation.get("entity_scope"):
+        scope = ENTITY_SCOPE_LABELS.get(str(interpretation["entity_scope"]), interpretation["entity_scope"])
+        details.append(f"범위: {scope}")
+    if details:
+        print("- 추출 조건:")
+        for item in details:
+            print(f"  - {item}")
+
+
 def _print_sql_rows(rows: List[Dict[str, Any]], limit: int = 5) -> None:
     if not rows:
         return
-    print("\nSQL evidence")
+    print("\n표 근거")
     for row in rows[:limit]:
-        label = row.get("normalized_label") or row.get("raw_label") or "-"
-        year = row.get("fiscal_year") or "-"
-        value = row.get("value_raw") or row.get("value_numeric") or "-"
-        unit = row.get("unit") or ""
-        table_title = row.get("table_title") or "-"
-        column_key = row.get("column_key") or "-"
-        print(f"- {year} | {label} | {value} {unit} | {table_title} | {column_key}")
+        year = _safe_text(row.get("fiscal_year"))
+        table_title = _safe_text(row.get("table_title"))
+        semantic = _safe_text(row.get("semantic_table_type"))
+        row_group = _safe_text(row.get("row_group_label"), fallback="")
+        company_kind = _safe_text(row.get("company_kind"), fallback="")
+        row_label = _safe_text(row.get("raw_label"))
+        column_key = _safe_text(row.get("column_key"))
+        value = _safe_text(row.get("value_raw") or row.get("value_numeric"))
+        unit = _safe_text(row.get("unit"), fallback="")
+        page_text = _page_text(row.get("page_start"), row.get("page_end"))
+        if row_group:
+            row_label = f"{row_group} > {row_label}"
+
+        print(f"- [{year}] {table_title}")
+        print(f"  row: {row_label}")
+        print(f"  col: {column_key}")
+        print(f"  val: {value}{(' ' + unit) if unit else ''}")
+        if company_kind:
+            print(f"  kind: {company_kind}")
+        print(f"  type: {semantic} | {page_text}")
 
 
 def _print_vector_hits(hits: List[Dict[str, Any]], limit: int = 3) -> None:
     if not hits:
         return
-    print("\nText evidence")
+    print("\n텍스트 근거")
     for hit in hits[:limit]:
         metadata = hit.get("metadata") or {}
-        section = metadata.get("section_title") or metadata.get("section_type") or "-"
-        page_start = metadata.get("page_start")
-        page_end = metadata.get("page_end")
-        page_text = f"p.{page_start}" if page_start == page_end or page_end is None else f"p.{page_start}-{page_end}"
-        print(f"- {section} | {page_text} | {_preview_text(hit.get('text', ''))}")
+        section_title = _safe_text(metadata.get("section_title"))
+        section_type = _safe_text(metadata.get("section_type"))
+        near_table = _safe_text(metadata.get("near_table_id"), fallback="")
+        page_text = _page_text(metadata.get("page_start"), metadata.get("page_end"))
+        print(f"- {section_title} ({section_type}) | {page_text}")
+        if near_table:
+            print(f"  near_table: {near_table}")
+        print(f"  text: {_preview_text(hit.get('text', ''))}")
 
 
 def _print_citations(citations: List[Dict[str, Any]], limit: int = 6) -> None:
     if not citations:
         return
-    print("\nCitations")
+    print("\n출처")
     for citation in citations[:limit]:
         if citation.get("kind") == "text_chunk":
-            page_start = citation.get("page_start")
-            page_end = citation.get("page_end")
-            page_text = f"p.{page_start}" if page_start == page_end or page_end is None else f"p.{page_start}-{page_end}"
-            print(f"- TEXT | {citation.get('chunk_id')} | {page_text}")
+            page_text = _page_text(citation.get("page_start"), citation.get("page_end"))
+            print(
+                f"- TEXT | {_safe_text(citation.get('chunk_id'))} | "
+                f"{_safe_text(citation.get('section_title') or citation.get('section_type'))} | {page_text}"
+            )
         else:
             print(
-                f"- SQL | {citation.get('table_id')} | "
-                f"{citation.get('column_key')} | fy={citation.get('fiscal_year')}"
+                f"- SQL | {_safe_text(citation.get('table_id'))} | "
+                f"{_safe_text(citation.get('column_key'))} | fy={_safe_text(citation.get('fiscal_year'))} | "
+                f"{_page_text(citation.get('page_start'), citation.get('page_end'))}"
             )
 
 
@@ -116,17 +225,12 @@ def _print_pretty_response(question: str, response: Dict[str, Any]) -> None:
     summary = bundle.get("retrieval_summary") or {}
 
     print("\n" + "=" * 72)
-    print(f"Question: {question}")
-    print(
-        f"Intent: {interpretation.get('intent')} | "
-        f"clarification={interpretation.get('clarification_needed')} | "
-        f"sql_rows={len(bundle.get('sql_results') or [])} | "
-        f"vector_hits={len(bundle.get('vector_hits') or [])}"
-    )
+    print(f"질문: {question}")
+    _print_interpretation(interpretation, bundle)
     if summary:
-        print(f"Retrieval summary: {json.dumps(summary, ensure_ascii=False)}")
+        print(f"- retrieval: {json.dumps(summary, ensure_ascii=False)}")
 
-    print("\nAnswer")
+    print("\n답변")
     print(answer.get("answer_text") or "(empty)")
 
     _print_sql_rows(bundle.get("sql_results") or [])

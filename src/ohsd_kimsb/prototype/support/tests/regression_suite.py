@@ -32,6 +32,7 @@ def run() -> Dict[str, Any]:
     AuditReportPipeline = importlib.import_module(f"{base_pkg}.core.pipeline").AuditReportPipeline
     SQLiteLoader = importlib.import_module(f"{base_pkg}.core.sqlite_loader").SQLiteLoader
     SQLTemplateEngine = importlib.import_module(f"{base_pkg}.query.sql_templates").SQLTemplateEngine
+    QueryInterpreter = importlib.import_module(f"{base_pkg}.query.interpreter").QueryInterpreter
     RetrievalFusionEngine = importlib.import_module(f"{base_pkg}.retrieval.fusion").RetrievalFusionEngine
     AuditQAService = importlib.import_module(f"{base_pkg}.service.hybrid_qa").AuditQAService
     runtime_module = importlib.import_module(f"{base_pkg}.service.runtime_factory")
@@ -51,7 +52,11 @@ def run() -> Dict[str, Any]:
         section_counts = Counter(section.section_type for section in result.sections)
         max_chunk = max((len(chunk.text) for chunk in result.text_chunks), default=0)
 
-        _check(result.meta.company_name == "삼성전자주식회사", f"{path.name}: company_name mismatch", failures)
+        _check(
+            bool(result.meta.company_name) and "삼성전자" in result.meta.company_name,
+            f"{path.name}: company_name mismatch",
+            failures,
+        )
         _check(year is not None and str(year) in path.name, f"{path.name}: fiscal_year extraction mismatch", failures)
         _check(result.meta.auditor_name is not None, f"{path.name}: auditor_name missing", failures)
         _check(result.meta.auditor_report_date is not None, f"{path.name}: auditor_report_date missing", failures)
@@ -80,7 +85,6 @@ def run() -> Dict[str, Any]:
                 failures,
             )
         if year == 2019:
-            # `2) 전기`처럼 이어지는 표도 앞선 요약재무정보 의미를 상속해야 한다.
             has_summary_continuation = any(
                 table.semantic_table_type == "subsidiary_summary_financial_table"
                 and table.title == "2) 전기"
@@ -130,6 +134,29 @@ def run() -> Dict[str, Any]:
     _check(runtime.runtime_report.get("preferred_embedding_model") == "qwen3-embedding:8b", "runtime: embedding model default mismatch", failures)
     _check(runtime.runtime_report.get("vector_backend") in {"chroma", "in_memory"}, "runtime: vector backend missing", failures)
 
+    drift_question = "2023년도 매출액과 2022년도 매출액을 비교해줘."
+    drift_interpretation = QueryInterpreter().interpret(
+        drift_question,
+        llm_output={
+            "intent": "trend_compare",
+            "metric_candidates": ["revenue"],
+            "row_label_filters": ["2023", "2022"],
+            "year_range": [2022, 2023],
+            "need_sql": True,
+            "need_vdb": False,
+        },
+    )
+    _check(
+        not drift_interpretation.row_label_filters,
+        "runtime: year-like row_label_filters should be sanitized",
+        failures,
+    )
+    _check(
+        drift_interpretation.year_range == (2022, 2023),
+        "runtime: year_range should remain after year anchor sanitization",
+        failures,
+    )
+
     sql_engine = SQLTemplateEngine()
     retrieval_engine = RetrievalFusionEngine(metadata_builder=runtime.metadata_builder)
     service = AuditQAService(
@@ -147,6 +174,17 @@ def run() -> Dict[str, Any]:
             "expect_sql": True,
             "expect_vdb": False,
             "clarification_needed": False,
+            "expect_value_raw": "209,052,241",
+            "expect_period": "당기",
+        },
+        {
+            "question": "2023년 매출액이 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_value_raw": "170,374,090",
+            "expect_period": "당기",
         },
         {
             "question": "2024년 감사의견이 뭐야?",
@@ -168,6 +206,37 @@ def run() -> Dict[str, Any]:
             "expect_sql": True,
             "expect_vdb": False,
             "clarification_needed": False,
+        },
+        {
+            "question": "2023년도와 2022년도 매출액을 비교해줘.",
+            "expected_intent": "trend_compare",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "매 출 액",
+            "expect_values_raw": ["170,374,090", "211,867,483"],
+            "expect_min_sql_rows": 2,
+            "expect_min_fiscal_years": 2,
+        },
+        {
+            "question": "지난 10년간 재무구조의 건전성 추이를 분석하기 위해, 자기자본비율 및 부채비율의 추이를 알려줘",
+            "expected_intent": "trend_compare",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_labels": ["자기자본비율", "부채비율"],
+            "expect_semantic_table_type": "derived_ratio_metric",
+            "expect_min_sql_rows": 10,
+        },
+        {
+            "question": "2024년 자기자본비율이 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "자기자본비율",
+            "expect_semantic_table_type": "derived_ratio_metric",
+            "expect_value_raw": "72.75%",
         },
         {
             "question": "재무적으로 위험한가?",
@@ -192,6 +261,60 @@ def run() -> Dict[str, Any]:
             "expect_row_label_fragment": "Samsung Semiconductor, Inc. (SSI)",
             "expect_column_key_fragment": "매출",
             "expect_semantic_table_type": "related_party_transaction_table",
+        },
+        {
+            "question": "2014년 전기의 개발비 기초장부가액이 얼마야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "기초장부가액",
+            "expect_column_key_fragment": "개발비",
+            "expect_semantic_table_type": "intangible_asset_rollforward_table",
+            "expect_value_raw": "602,274",
+            "expect_table_title_fragment": "전기",
+        },
+        {
+            "question": "2014년 보험수리적 가정에 대해 알려줘(당기말의 할인율) 표를 참고해서 정확한 수치를 알려줘.",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "할인율",
+            "expect_semantic_table_type": "actuarial_assumption_table",
+            "expect_value_raw": "4.4%",
+            "expect_period": "당기말",
+        },
+        {
+            "question": "2014년 당기말에는 할인율과 임금상승률을 몇으로 가정하고 작성된거야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_labels": ["할인율", "미래임금상승률"],
+            "expect_semantic_table_type": "actuarial_assumption_table",
+            "expect_values_raw": ["4.4%", "6.6%"],
+            "expect_period": "당기말",
+        },
+        {
+            "question": "2014년 유형자산에 어떤 종류의 자산들이 포함되어 있어?",
+            "expected_intent": "text_explanation",
+            "expect_sql": True,
+            "expect_vdb": True,
+            "clarification_needed": False,
+            "expect_column_key_fragment": "토지",
+            "expect_semantic_table_type": "property_plant_equipment_rollforward_table",
+            "expect_table_title_fragment": "유형자산",
+        },
+        {
+            "question": "2024년 지분율이 70% 미만인 종속기업들을 리스트업해",
+            "expected_intent": "comparison_list_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_column_key_fragment": "지분율",
+            "expect_semantic_table_type": "subsidiary_status_table",
+            "expect_row_label_fragment": "Samsung Lennox HVAC North America, LLC",
         },
     ]
 
@@ -219,6 +342,14 @@ def run() -> Dict[str, Any]:
             else:
                 _check(not bundle["sql_results"], f"query `{case['question']}`: sql_results should be empty", failures)
 
+            expected_min_sql_rows = case.get("expect_min_sql_rows")
+            if expected_min_sql_rows is not None:
+                _check(
+                    len(bundle["sql_results"]) >= expected_min_sql_rows,
+                    f"query `{case['question']}`: sql_results fewer than expected minimum",
+                    failures,
+                )
+
             if case["expect_vdb"]:
                 _check(bool(bundle["vector_hits"]), f"query `{case['question']}`: vector_hits empty", failures)
                 _check(
@@ -231,7 +362,27 @@ def run() -> Dict[str, Any]:
 
             if interpretation["intent"] == "trend_compare" and not interpretation["clarification_needed"]:
                 years = {row.get("fiscal_year") for row in bundle["sql_results"] if row.get("fiscal_year") is not None}
-                _check(len(years) >= 3, "trend_compare query: fewer than 3 fiscal years returned", failures)
+                _check(
+                    len(years) >= int(case.get("expect_min_fiscal_years", 3)),
+                    "trend_compare query: fewer than expected fiscal years returned",
+                    failures,
+                )
+
+            if interpretation["intent"] == "comparison_list_lookup" and not interpretation["clarification_needed"]:
+                _check(
+                    all(
+                        row.get("value_numeric") is not None and float(row["value_numeric"]) < 70
+                        for row in bundle["sql_results"]
+                    ),
+                    f"query `{case['question']}`: comparison threshold mismatch",
+                    failures,
+                )
+                if interpretation.get("entity_scope") == "subsidiary":
+                    _check(
+                        all((row.get("company_kind") or "") == "subsidiary" for row in bundle["sql_results"]),
+                        f"query `{case['question']}`: non-subsidiary rows leaked into subsidiary list",
+                        failures,
+                    )
 
             expected_row_label_fragment = case.get("expect_row_label_fragment")
             if expected_row_label_fragment:
@@ -240,6 +391,15 @@ def run() -> Dict[str, Any]:
                     f"query `{case['question']}`: expected row label fragment missing",
                     failures,
                 )
+
+            expected_row_labels = case.get("expect_row_labels")
+            if expected_row_labels:
+                for expected_row_label in expected_row_labels:
+                    _check(
+                        any(expected_row_label in (row.get("raw_label") or "") for row in bundle["sql_results"]),
+                        f"query `{case['question']}`: expected row label `{expected_row_label}` missing",
+                        failures,
+                    )
 
             expected_column_key_fragment = case.get("expect_column_key_fragment")
             if expected_column_key_fragment:
@@ -254,6 +414,39 @@ def run() -> Dict[str, Any]:
                 _check(
                     any(row.get("semantic_table_type") == expected_semantic_table_type for row in bundle["sql_results"]),
                     f"query `{case['question']}`: expected semantic table type missing",
+                    failures,
+                )
+
+            expected_value_raw = case.get("expect_value_raw")
+            if expected_value_raw:
+                _check(
+                    any((row.get("value_raw") or "") == expected_value_raw for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected value_raw missing",
+                    failures,
+                )
+
+            expected_values_raw = case.get("expect_values_raw")
+            if expected_values_raw:
+                for expected_value in expected_values_raw:
+                    _check(
+                        any((row.get("value_raw") or "") == expected_value for row in bundle["sql_results"]),
+                        f"query `{case['question']}`: expected value_raw `{expected_value}` missing",
+                        failures,
+                    )
+
+            expected_period = case.get("expect_period")
+            if expected_period:
+                _check(
+                    any((row.get("period") or "") == expected_period for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected period missing",
+                    failures,
+                )
+
+            expected_table_title_fragment = case.get("expect_table_title_fragment")
+            if expected_table_title_fragment:
+                _check(
+                    any(expected_table_title_fragment in (row.get("table_title") or "") for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected table title fragment missing",
                     failures,
                 )
 
@@ -281,6 +474,20 @@ def run() -> Dict[str, Any]:
                     "retrieval_summary": bundle.get("retrieval_summary", {}),
                 }
             )
+
+    subsequent_event_chunks = [
+        chunk
+        for result in parse_results
+        if result.meta.fiscal_year == 2024
+        for chunk in result.text_chunks
+        if chunk.section_type == "subsequent_events"
+    ]
+    _check(bool(subsequent_event_chunks), "2024 subsequent_events chunk missing", failures)
+    _check(
+        any(len((chunk.text or "").strip()) > len("31. 보고기간 후 사건") for chunk in subsequent_event_chunks),
+        "2024 subsequent_events chunk lost body text",
+        failures,
+    )
 
     langchain_available = {
         module: bool(importlib.util.find_spec(module))
