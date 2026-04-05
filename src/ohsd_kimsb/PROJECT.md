@@ -1,255 +1,562 @@
 # Audit Report Structure-First Prototype
 
-이 작업 공간은 삼성전자 감사보고서 HTML(`2014~2024`)을 `structure-first` 방식으로 파싱하고,
-그 결과를 하이브리드 QA 시스템의 입력 데이터로 정규화하는 것을 목표로 한다.
+## 목적
+이 프로젝트는 `2014~2024` 감사보고서 HTML을 `structure-first` 방식으로 파싱해,
+회계 질의응답 시스템에 필요한 두 종류의 저장소를 만든다.
 
-핵심 원칙은 다음과 같다.
+- SQLite RDB: 표에서 나온 정량 fact 저장
+- Chroma VDB: 본문 설명 텍스트 chunk 저장
+
+핵심 원칙은 아래와 같다.
 
 1. HTML을 먼저 markdown으로 바꾸지 않는다.
-2. DOM/블록 구조를 보존한 intermediate representation을 먼저 만든다.
-3. 표는 RDB 적재용 `row/value` 구조로 정규화한다.
-4. 본문 텍스트는 섹션 단위로 정리해 VDB 적재용 chunk로 만든다.
-5. markdown은 저장 원본이 아니라 검수용 파생 산출물이다.
+2. DOM/블록 구조를 보존한 뒤, 표와 본문을 따로 정규화한다.
+3. 숫자는 SQL로 찾고, 설명은 Chroma로 찾는다.
+4. 최종 LLM은 검색된 근거를 설명하는 역할만 맡는다.
 
-## 프로젝트를 두 단계로 분리한 이유
-
-이 프로젝트는 이제 아래 두 실행 경로로 나뉜다.
+## 운영 방식
 
 ### 1. Offline Ingest
-- 목적: `data/*.htm`를 미리 파싱하고 영속 산출물을 만든다.
-- 출력:
-  - SQLite DB
-  - Chroma collection
-  - ingest manifest JSON
-- 특징:
-  - 사용자의 질문을 받지 않는다.
-  - 배치성 작업이다.
-  - 서비스 시작 전에 한 번 실행한다.
+사전에 한 번 실행하는 배치 작업이다.
 
-### 2. Online Service
-- 목적: 이미 구축된 SQLite/Chroma를 읽고 질문에 답한다.
-- 입력:
-  - prebuilt SQLite DB
-  - prebuilt Chroma collection
-  - 사용자 질문
-- 특징:
-  - HTML을 다시 파싱하지 않는다.
-  - 질의 해석, SQL/VDB retrieval, 답변 생성만 수행한다.
-
-이 분리를 통해 `데이터 구축`과 `실시간 질의 처리`의 책임을 분리했다.
-
-## 폴더별 역할
-
-### `prototype/core/`
-- 감사보고서 HTML 파싱의 중심 계층이다.
-- `html_io.py`: 인코딩 감지와 HTML 디코딩.
-- `parser.py`: block/section 분해, 문서 메타 추출.
-- `table_processor.py`: 표 분류, rowspan/colspan 해체, row/value 정규화.
-- `pipeline.py`: 파싱 결과를 하나의 `FilingParseResult`로 조립.
-- `sqlite_loader.py`: RDB 초안 스키마 기준 적재.
-- `rdb_schema_draft.sql`: SQLite 기반 스키마 초안.
-
-### `prototype/query/`
-- 사용자 질문을 구조화된 질의 해석 결과로 바꾸는 계층이다.
-- `schema.py`: intent, metric, year, routing flag 스키마 정의.
-- `catalog.py`: metric/section alias 사전.
-- `interpreter.py`: 규칙 기반 fallback 질의 해석기.
-- `langchain_interpreter.py`: LangChain + 로컬 LLM 기반 질의 해석기.
-- `policy.py`: LLM 출력 이후 최종 `need_sql / need_vdb / clarification_needed`를 확정.
-- `sql_templates.py`: 자유 SQL 대신 템플릿 기반 SQL plan 생성/실행.
-
-### `prototype/retrieval/`
-- VDB metadata, 검색, fusion을 담당하는 계층이다.
-- `chroma_metadata.py`: text chunk를 Chroma 문서 형식으로 변환.
-- `chroma_store.py`: Chroma persistent collection 래퍼.
-- `fusion.py`: SQL 결과와 vector hit를 결합하고 재랭킹.
-- `organizer.py`: generation 직전 evidence 정리.
-- `schema.py`: vector hit / evidence bundle 구조 정의.
-
-### `prototype/llm/`
-- 로컬 LLM 및 임베딩 모델 어댑터 계층이다.
-- `langchain_local.py`: LangChain/Ollama 기반 chat model 호출.
-- 같은 파일 안에 `LangChainLocalEmbedding`을 두어 Chroma용 외부 임베딩 함수를 연결한다.
-- 기본 모델 설정:
-  - 질의 해석 LLM: `qwen3-12b`
-  - 최종 답변 LLM: `qwen3-12b`
-  - 임베딩 모델: `qwen3-8b`
-
-### `prototype/service/`
-- 상위 orchestration 계층이다.
-- `hybrid_qa.py`: `질의 해석 -> SQL -> retrieval -> answer composition`을 묶는다.
-- `runtime_factory.py`: LangChain/Ollama/Chroma 운영 경로를 우선 사용하고, 필요 시 fallback을 결정한다.
-- `artifact_paths.py`: SQLite/Chroma/manifest 기본 산출물 경로를 정의한다.
-
-### `prototype/support/answering/`
-- retrieval 결과를 근거로 최종 답변과 citation을 조합한다.
-- LangChain LLM을 우선 사용하고, 실패 시 formatter fallback을 유지한다.
-
-### `prototype/support/examples/`
-- 수동 검증과 self-contained demo 실행용 스크립트다.
-- 이 스크립트들은 이해와 점검을 위해 여전히 HTML을 직접 읽을 수 있다.
-
-### `prototype/support/cli/`
-- 실제 운영 흐름에 맞춘 CLI 엔트리포인트다.
-- `offline_ingest.py`: HTML -> SQLite/Chroma/manifest 구축
-- `service_cli.py`: prebuilt SQLite/Chroma를 읽어 질문에 답변
-
-### `prototype/support/tests/`
-- 전수 회귀 테스트 계층이다.
-- `regression_suite.py`는 루트 `data/`의 `2014~2024` HTML 전체를 대상으로 파싱, retrieval, citation 흐름을 검증한다.
-
-## 호출 플로우
-
-### A. Offline Ingest
-1. `data/*.htm` 입력
-2. `prototype/core/html_io.py`
-3. `prototype/core/parser.py`
-4. `prototype/core/table_processor.py`
-5. `prototype/core/pipeline.py`
-6. `filings / sections / tables / table_rows / table_values / text_chunks / blocks` payload 생성
-7. `prototype/core/sqlite_loader.py`로 SQLite 적재
-8. `prototype/retrieval/chroma_metadata.py`로 Chroma 문서 생성
-9. `prototype/service/runtime_factory.py`로 Chroma upsert
-10. `offline_ingest.py`가 manifest 저장
-
-### B. Online Service
-1. 사용자 질문 입력
-2. `prototype/service/runtime_factory.py`가 prebuilt Chroma collection 연결
-3. `prototype/query/langchain_interpreter.py`
-4. 실패 시 `prototype/query/interpreter.py`
-5. `prototype/query/policy.py`가 최종 라우팅 확정
-6. `prototype/query/sql_templates.py`가 SQL plan 생성
-7. SQLite DB에서 정량 evidence 조회
-8. `prototype/retrieval/chroma_store.py`가 Chroma query 수행
-9. `prototype/retrieval/fusion.py`와 `prototype/retrieval/organizer.py`가 evidence 정리
-10. `prototype/support/answering/composer.py`가 최종 답변 + citation/page 생성
-
-## 기본 운영 경로
-
-현재 기본 운영 경로는 아래와 같다.
-
-1. 질의 해석: `LangChain + Ollama + qwen3-12b`
-2. 최종 답변: `LangChain + Ollama + qwen3-12b`
-3. 임베딩: `LangChain OllamaEmbeddings + qwen3-8b`
-4. 벡터 저장소: `Chroma persistent collection`
-
-`prototype/service/runtime_factory.py`가 이 경로를 우선 선택한다.
-단, 샌드박스나 로컬 환경에서 의존성 또는 서버가 없으면 fallback을 유지한다.
-
-fallback 규칙은 다음과 같다.
-
-- 질의 해석 LLM 실패 -> 규칙 기반 `QueryInterpreter`
-- Chroma/임베딩 실패 -> `InMemoryVectorStore`
-- 최종 answer LLM 실패 -> formatter fallback
-
-즉 현재 코드는 `운영 경로 우선 + 안전한 fallback 유지` 전략이다.
-
-## 로컬에서 테스트하는 순서
-
-### 0. 의존성 설치
-
-```bash
-pip install -r src/ohsd_kimsb/prototype/requirements-local-llm.txt
-```
-
-Ollama에는 아래 모델이 준비되어 있어야 한다.
-
-- `qwen3-12b`
-- `qwen3-8b`
-
-### 1. 전체 회귀 테스트
-
-```bash
-python src/ohsd_kimsb/prototype/support/tests/regression_suite.py
-```
-
-- 목적: 현재 환경이 최소 동작하는지 확인
-- 범위: `2014~2024` HTML 전체
-
-### 2. 임베딩/Chroma 경로만 별도 점검
-
-```bash
-python src/ohsd_kimsb/prototype/support/examples/demo_embedding_runtime.py --year 2024 --embedding-model qwen3-8b
-```
-
-- 목적: embedding backend와 Chroma 연결 가능 여부 확인
-
-### 3. 실제 운영 구조로 배치 ingest
-
-```bash
-python src/ohsd_kimsb/prototype/support/cli/offline_ingest.py
-```
-
+- 입력: `data/*.htm`
 - 출력:
   - `.runtime/audit_qa/sqlite/audit_reports.sqlite3`
   - `.runtime/audit_qa/chroma/audit_chunks`
   - `.runtime/audit_qa/manifests/offline_ingest.json`
 
-### 4. 실제 운영 구조로 서비스 질의
+하는 일은 다음과 같다.
 
-```bash
-python src/ohsd_kimsb/prototype/support/cli/service_cli.py "2024년 감사의견이 뭐야?"
+1. HTML 디코딩
+2. block/section/table/text chunk 파싱
+3. 표 fact를 SQLite에 적재
+4. text chunk를 Chroma에 적재
+5. 실행 결과를 manifest에 기록
+
+### 2. Online Service
+사전에 구축된 SQLite/Chroma를 읽어서 질문에 답하는 단계다.
+
+1. 사용자 질문 입력
+2. 질의 해석 LLM
+3. SQL 조회
+4. Chroma 조회
+5. evidence 정리
+6. 최종 답변 생성
+
+중요한 점은 온라인 서비스에서는 HTML을 다시 파싱하지 않는다는 것이다.
+
+## 현재 런타임 산출물
+현재 runtime DB는 추론에 필요한 최소 구조만 남긴다.
+
+- `filings`
+- `metric_facts`
+- `text_chunks`
+
+### `filings`
+문서 단위 메타데이터다.
+
+- `filing_id`
+- `company_name`
+- `fiscal_year`
+- `auditor_name`
+- `source_file`
+
+### `metric_facts`
+표의 숫자값을 평탄화한 fact 테이블이다.
+
+- `semantic_table_type`
+- `table_title`
+- `row_group_label`
+- `raw_label`
+- `column_key`
+- `value_raw`
+- `value_numeric`
+- `page_start`
+
+### `text_chunks`
+Chroma에 임베딩되는 본문 청크의 디버그/검수용 원본 기록이다.
+
+- `section_type`
+- `section_title`
+- `topic_hint`
+- `near_table_id`
+- `text`
+- `page_start`
+- `page_end`
+
+## 폴더 역할
+
+### `prototype/core`
+파싱과 정규화의 중심이다.
+
+- `html_io.py`: HTML 디코딩
+- `parser.py`: block/section 생성
+- `table_processor.py`: 표 정규화, 행/값 복원, 의미 분류
+- `pipeline.py`: 파싱 결과 조립
+- `sqlite_loader.py`: SQLite 적재
+- `rdb_schema_draft.sql`: runtime SQLite 스키마
+
+### `prototype/query`
+질문을 구조화된 질의로 바꾸는 계층이다.
+
+- `interpreter.py`: 규칙 기반 fallback 해석
+- `langchain_interpreter.py`: LangChain + 로컬 LLM 기반 질의 해석
+- `policy.py`: `need_sql / need_vdb / clarification_needed` 확정
+- `sql_templates.py`: 템플릿 기반 SQL 생성 및 실행
+
+### `prototype/retrieval`
+Chroma 문서화와 SQL/VDB 결합 담당 계층이다.
+
+- `chroma_metadata.py`: text chunk -> Chroma 문서
+- `chroma_store.py`: Chroma persistent store 어댑터
+- `fusion.py`: SQL + vector retrieval 결합
+- `organizer.py`: 최종 evidence 정리
+
+### `prototype/llm`
+로컬 LLM과 임베딩 모델 어댑터다.
+
+- 질의 해석 LLM: `qwen3:8b`
+- 최종 답변 LLM: `qwen3:8b`
+- 임베딩 모델: `qwen3-embedding:8b`
+
+### `prototype/service`
+전체 오케스트레이션 계층이다.
+
+- `runtime_factory.py`: LangChain/Ollama/Chroma 조립
+- `hybrid_qa.py`: 질의 해석 -> SQL -> retrieval -> answer 흐름 연결
+
+### `prototype/support/cli`
+실행용 엔트리포인트다.
+
+- `offline_ingest.py`: 배치 구축
+- `service_cli.py`: 대화형 질의 실행
+
+### `prototype/support/answering`
+최종 답변 생성 계층이다.
+
+- `composer.py`: evidence 기반 답변 조합
+- `schema.py`: 최종 응답 스키마
+
+### `prototype/support/tests`
+회귀 테스트 계층이다.
+
+- `regression_suite.py`: `2014~2024` 전 파일 + 대표 질의 검증
+
+## 호출 흐름
+
+### Offline Ingest
+1. `data/*.htm`
+2. `core/html_io.py`
+3. `core/parser.py`
+4. `core/table_processor.py`
+5. `core/pipeline.py`
+6. `core/sqlite_loader.py`
+7. `retrieval/chroma_metadata.py`
+8. `retrieval/chroma_store.py`
+9. `offline_ingest.py`
+
+### Online Service
+1. 사용자 질문
+2. `service/runtime_factory.py`
+3. `query/langchain_interpreter.py`
+4. `query/policy.py`
+5. `query/sql_templates.py`
+6. `retrieval/fusion.py`
+7. `retrieval/organizer.py`
+8. `support/answering/composer.py`
+
+## 파싱 전략
+
+### 구조 보존
+HTML을 먼저 아래 단위로 분해한다.
+
+- `cover`
+- `section_heading`
+- `paragraph`
+- `table`
+- `footnote`
+- `page_break`
+
+### 표 정규화
+표는 단순 `<table>` 문자열이 아니라, 다음 순서로 정규화한다.
+
+1. `rowspan/colspan`을 펼쳐 logical grid 생성
+2. header path 복원
+3. row hierarchy 복원
+4. 숫자 cell만 fact로 추출
+5. 표의 회계 의미를 `semantic_table_type`으로 분류
+
+### 본문 chunking
+본문은 section-aware 방식으로 자른다.
+
+1. 섹션 제목을 먼저 인식
+2. 섹션 내부 문단을 모음
+3. 길이 제한을 넘으면 문단 경계로 분리
+4. 각 chunk에 `section_type`, `section_title`, `page`, `near_table_id`를 저장
+
+## 파싱 전략 예시
+아래 예시는 실제 감사보고서의 표/본문이 runtime DB에 어떻게 보존되는지 보여준다.
+
+### 예시 1. 2024 특수관계자 거래표
+<table>
+  <tr>
+    <th align="left">실제 HTM 표 일부</th>
+    <th align="left">SQLite `metric_facts` 저장 형태</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+표 제목:
+나. 당기 및 전기 중 특수관계자와의
+매출ㆍ매입 등 거래 내역은 다음과 같습니다. (1) 당기
+
+상위 구분: 종속기업
+기업명: Samsung Semiconductor, Inc. (SSI)
+매출 등: 42,993,409
+매입 등:   952,847
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+semantic_table_type = related_party_transaction_table
+table_title          = 나. 당기 및 전기 중 특수관계자와의 매출ㆍ매입 등 거래 내역...
+row_group_label      = 종속기업
+raw_label            = Samsung Semiconductor, Inc. (SSI)
+column_key           = 매출_등
+value_raw            = 42,993,409
+page_start           = 94
+
+semantic_table_type = related_party_transaction_table
+raw_label            = Samsung Semiconductor, Inc. (SSI)
+column_key           = 매입_등
+value_raw            = 952,847
+page_start           = 94
+      </pre>
+    </td>
+  </tr>
+</table>
+
+이 예시의 핵심은 `SSI`라는 이름을 찾는 것이 아니라,
+이 표가 `회사 전체 매출표`가 아니라 `특수관계자 거래표`라는 의미까지 함께 보존한다는 점이다.
+
+### 예시 2. 2024 특수관계자 잔액표
+<table>
+  <tr>
+    <th align="left">실제 HTM 표 일부</th>
+    <th align="left">SQLite `metric_facts` 저장 형태</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+표 제목:
+다. 보고기간종료일 현재 특수관계자에 대한
+채권ㆍ채무 등 잔액은 다음과 같습니다. (1) 당기말
+
+상위 구분: 종속기업
+기업명: Samsung Semiconductor, Inc. (SSI)
+채권 등: 11,910,574
+채무 등:    340,273
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+semantic_table_type = related_party_balance_table
+row_group_label      = 종속기업
+raw_label            = Samsung Semiconductor, Inc. (SSI)
+column_key           = 채권_등_2
+value_raw            = 11,910,574
+page_start           = 98
+
+semantic_table_type = related_party_balance_table
+raw_label            = Samsung Semiconductor, Inc. (SSI)
+column_key           = 채무_등_3
+value_raw            = 340,273
+page_start           = 98
+      </pre>
+    </td>
+  </tr>
+</table>
+
+### 예시 3. 2019 요약재무정보의 연속 표
+<table>
+  <tr>
+    <th align="left">실제 HTM 표 일부</th>
+    <th align="left">SQLite `metric_facts` 저장 형태</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+앞 표 제목:
+다. 보고기간종료일 현재 주요 종속기업 및 관계기업
+투자의 요약 재무정보는 다음과 같습니다.
+(1) 주요 종속기업 1) 당기
+
+이어지는 다음 표 제목:
+2) 전기
+
+기업명: Samsung Semiconductor, Inc.(SSI)
+자산:   9,306,621
+부채:   4,288,544
+매출액: 29,592,773
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+semantic_table_type = subsidiary_summary_financial_table
+table_title          = 2) 전기
+raw_label            = Samsung Semiconductor, Inc.(SSI)
+column_key           = 자산
+value_raw            = 9,306,621
+page_start           = 53
+
+semantic_table_type = subsidiary_summary_financial_table
+raw_label            = Samsung Semiconductor, Inc.(SSI)
+column_key           = 매출액
+value_raw            = 29,592,773
+page_start           = 53
+      </pre>
+    </td>
+  </tr>
+</table>
+
+이 예시는 제목이 짧은 후속 표(`2) 전기`)라도
+직전 문맥과 헤더를 보고 앞 표의 회계 의미를 상속하도록 보강한 사례다.
+
+### 예시 4. 2024 우발부채 본문 chunk
+<table>
+  <tr>
+    <th align="left">실제 HTM 본문 일부</th>
+    <th align="left">SQLite `text_chunks` 저장 형태</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+16. 우발부채와 약정사항:
+가. 지급보증한 내역
+(1) 보고기간종료일 현재 회사가 해외종속기업의
+자금조달 등을 위하여 제공하고 있는 채무보증 내역은...
+(2) ...지급보증 한도액은 532,893 백만원입니다.
+나. 소송 등
+보고기간종료일 현재 회사는 다수의 회사 등과...
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+section_type  = contingent_liabilities_and_commitments
+section_title = 16. 우발부채와 약정사항:
+topic_hint    = contingent_liabilities_and_commitments
+near_table_id = audit_report_2024_2024_b_00396
+page_start    = 56
+page_end      = 57
+text_len      = 766
+      </pre>
+    </td>
+  </tr>
+</table>
+
+이 구조 덕분에 정량표와 설명문을 서로 연결해서 사용할 수 있다.
+
+## 사용자 질문은 어떻게 해석되는가
+이 시스템은 사용자의 질문을 바로 SQL이나 답변으로 바꾸지 않는다.
+먼저 질문의 **의도**를 작게 나눈 뒤, 그 결과를 바탕으로 어느 저장소를 볼지 결정한다.
+
+비전공자 기준으로 쉽게 말하면 아래 순서다.
+
+1. 사용자가 질문한다.
+2. 시스템은 먼저 “이 질문이 숫자를 묻는가, 설명을 묻는가, 둘 다 묻는가”를 판단한다.
+3. 숫자 질문이면 SQLite를 우선 보고, 설명 질문이면 Chroma를 우선 본다.
+4. 필요한 근거를 모은 뒤, 마지막 LLM이 그 근거를 설명하는 문장으로 바꾼다.
+
+즉 LLM이 처음부터 회계 전문가처럼 모든 것을 추론하는 구조가 아니다.
+질문을 작게 나누고, 각 단계별로 시스템이 역할을 나눠 갖는 구조다.
+
+### 질문 해석의 실제 예시
+<table>
+  <tr>
+    <th align="left">사용자 질문</th>
+    <th align="left">시스템 내부 해석</th>
+    <th align="left">조회 대상</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+2024년 매출액이 얼마야?
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+intent            = metric_lookup
+metric_candidates = [revenue]
+year              = 2024
+need_sql          = true
+need_vdb          = false
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+SQLite `metric_facts`
+우선 조회
+      </pre>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+2024년 감사의견이 뭐야?
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+intent            = text_explanation
+section_candidates = [audit_opinion]
+need_sql          = false
+need_vdb          = true
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+Chroma `text_chunks`
+우선 조회
+      </pre>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+2024년 매출액과 관련 설명을 알려줘
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+intent            = metric_with_explanation
+metric_candidates = [revenue]
+year              = 2024
+need_sql          = true
+need_vdb          = true
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+SQLite + Chroma
+동시 조회
+      </pre>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <pre>
+이 회사는 잘될 회사야?
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+intent               = metric_lookup
+clarification_needed = true
+clarification_reason = metric_required
+      </pre>
+    </td>
+    <td valign="top">
+      <pre>
+즉시 답하지 않고
+재질문 유도
+      </pre>
+    </td>
+  </tr>
+</table>
+
+### 왜 이렇게 설계했는가
+감사보고서 질의는 일반 검색보다 더 까다롭다.
+
+- 숫자 질문과 설명 질문이 섞여 있다.
+- 같은 “매출”이라는 단어도 회사 전체 매출과 특수관계자 거래 매출이 다르다.
+- 연도, 단위, 표 종류, 주석 맥락이 중요하다.
+
+그래서 질문을 먼저 구조화해서,
+무엇을 어디서 찾을지 결정한 뒤 답하도록 설계했다.
+
+## 이 구조는 RAG인가, 하드코딩인가
+현재 구조는 **하드코딩된 답변 시스템이 아니라, 정책과 스키마로 안정화한 하이브리드 RAG**에 가깝다.
+
+### 단순 하드코딩과 다른 점
+하드코딩된 답변 시스템이라면:
+
+- 질문별 답을 미리 정해둔다.
+- 특정 단어가 나오면 고정 문자열을 반환한다.
+- 예외 케이스를 계속 늘려간다.
+
+현재 구조는 그렇지 않다.
+
+- 답을 미리 정해두지 않는다.
+- 먼저 질문을 구조화한다.
+- 그 결과로 SQLite와 Chroma를 검색한다.
+- 마지막 답변은 항상 검색된 근거를 바탕으로 만든다.
+
+즉 “답 자체”를 하드코딩한 것이 아니라,
+**검색 경로와 판단 기준을 명시적으로 설계한 것**이다.
+
+### 왜 이런 정책이 필요한가
+감사보고서 도메인에서는 단순 임베딩 검색만으로는 아래 문제가 생긴다.
+
+- 회사 전체 매출과 특수관계자 거래 매출을 섞어버림
+- 감사의견과 회계정책 설명을 혼동함
+- 추상 질문에 대해 근거 없이 단정함
+
+그래서 현재 시스템은 아래를 정책으로 고정한다.
+
+- 질문 유형은 소수의 intent로 제한
+- SQL은 자유 생성이 아니라 템플릿 기반
+- Chroma는 metadata filter로 범위를 축소
+- 추상 질문은 clarification으로 되돌림
+
+### 한 줄 정리
+이 시스템은 `LLM이 다 알아서 하는 구조`가 아니다.
+대신,
+
+- 파싱 단계에서 회계 의미를 구조화하고
+- 질의 단계에서 질문을 구조화하고
+- 검색 단계에서 SQL/VDB를 역할 분리한 뒤
+- 최종 LLM은 근거를 설명만 하도록 제한한다.
+
+즉 **회계 전문성을 모델에 전부 기대지 않고, 시스템 설계에 분산시킨 구조**라고 이해하면 된다.
+
+### 남은 보완점
+- `note_section`의 `topic_hint`는 아직 대부분 일반적이다.
+- 일부 주석 문단은 본문 손실 가능성이 있다.
+  - 예: `31. 보고기간 후 사건`은 현재 chunk가 제목만 남는 경우가 있다.
+- 손익계산서/포괄손익계산서처럼 본표 내부 종류 구분을 더 적극적으로 활용할 여지가 있다.
+
+## 테스트 기준
+앞으로 검토는 아래 기준으로 본다.
+
+1. 루트 `data/`의 `2014~2024` HTML 전체를 기준으로 한다.
+2. `prototype/support/tests/regression_suite.py`로 전연도 회귀를 확인한다.
+3. 새 `.runtime` 기준으로 아래를 같이 본다.
+   - manifest runtime report
+   - SQLite 적재값
+   - Chroma 문서 수
+   - 실제 HTM과 대표 샘플 대조
+
+## 권장 실행
+
+### Offline Ingest
+```cmd
+python src\ohsd_kimsb\prototype\support\cli\offline_ingest.py ^
+  --db-path .runtime\audit_qa\sqlite\audit_reports.sqlite3 ^
+  --chroma-dir .runtime\audit_qa\chroma\audit_chunks ^
+  --manifest-path .runtime\audit_qa\manifests\offline_ingest.json ^
+  --embedding-model qwen3-embedding:8b ^
+  --ollama-base-url http://localhost:11434 ^
+  --reset-db ^
+  --reset-chroma ^
+  --strict-runtime
 ```
 
-- 이 경로에서는 HTML을 재파싱하지 않는다.
-- 오직 prebuilt DB/Chroma만 사용한다.
-
-### 5. self-contained demo
-
-```bash
-python src/ohsd_kimsb/prototype/support/examples/demo_hybrid_query.py "2024년 매출액과 관련 설명을 알려줘" --year 2024
-python src/ohsd_kimsb/prototype/support/examples/demo_final_answer.py "2024년 감사의견이 뭐야?" --year 2024
+### Online Service
+```cmd
+python src\ohsd_kimsb\prototype\support\cli\service_cli.py ^
+  --manifest-path .runtime\audit_qa\manifests\offline_ingest.json ^
+  --intent-model qwen3:8b ^
+  --answer-model qwen3:8b ^
+  --embedding-model qwen3-embedding:8b ^
+  --strict-runtime
 ```
-
-- 목적: 이해와 디버깅
-- 특징: demo는 HTML을 직접 읽는 self-contained 경로다.
-
-## 샌드박스 검증 결과
-
-현재 샌드박스에서는 아래 패키지가 없다.
-
-- `langchain_core`
-- `langchain_ollama`
-- `chromadb`
-
-그래서 검증 결과는 다음과 같다.
-
-- `regression_suite.py`: 통과
-- `offline_ingest.py`: 통과
-- `service_cli.py`: 통과
-- 실제 사용된 backend:
-  - query interpreter: LangChain 경로 시도 후 fallback
-  - answer composer: LangChain 경로 시도 후 fallback
-  - vector store: Chroma 경로 시도 후 `InMemoryVectorStore` fallback
-
-즉 코드 구조는 분리되었고 작동하지만, 샌드박스에서는 운영 경로가 아니라 fallback 경로가 실행됐다.
-
-## 현재 완성도
-
-현재 상태를 단계별로 보면 다음과 같다.
-
-- 구조-first 파싱: 높음
-- RDB/VDB 정규화: 높음
-- 질의 해석/라우팅: 중상
-- SQL/VDB fusion: 중상
-- Offline Ingest / Online Service 분리: 중상
-- LangChain/Ollama/Chroma 운영 경로 실제 검증: 중
-- 최종 answer generation 안정화: 중
-
-대략적인 전체 완성도는 `75% 전후`로 본다.
-
-## 아직 부족한 점
-
-1. 샌드박스에는 `langchain_core`, `langchain_ollama`, `chromadb`가 없어 실제 운영 경로를 end-to-end로 검증하지 못했다.
-2. Chroma persistent collection을 장기 운영 기준으로 관리하는 별도 update/rebuild 전략은 아직 단순하다.
-3. `service_cli.py`는 CLI 수준이고, 실제 서버형 엔트리포인트는 아직 없다.
-4. answer prompt와 formatting은 fallback 안정성은 확보했지만 운영형 품질 최적화가 더 필요하다.
-5. 로그 기반 alias 보강과 abstract question 확장은 아직 초기 단계다.
-
-## 검증 기준
-
-앞으로 모든 검수는 아래 기준을 따른다.
-
-1. 루트 `data/` 폴더의 `2014~2024` HTML 전체를 대상으로 한다.
-2. `prototype/support/tests/regression_suite.py`를 기준 회귀로 사용한다.
-3. 파싱 결과, SQL 결과, vector hit, citation/page까지 함께 확인한다.
