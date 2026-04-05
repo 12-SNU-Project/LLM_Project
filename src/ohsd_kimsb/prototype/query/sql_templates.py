@@ -8,8 +8,10 @@ from .schema import QueryIntent, QueryInterpretation, SQLQueryPlan
 
 
 class SQLTemplateEngine:
+    # Runtime DB keeps one flat fact table, so label matching only touches
+    # columns needed for metric lookup.
     LABEL_EXPR = (
-        "REPLACE(REPLACE(REPLACE(COALESCE(r.normalized_label, r.raw_label), ' ', ''), char(10), ''), char(13), '')"
+        "REPLACE(REPLACE(REPLACE(COALESCE(m.normalized_label, m.raw_label), ' ', ''), char(10), ''), char(13), '')"
     )
 
     BASE_SELECT = """
@@ -17,32 +19,31 @@ SELECT
     f.filing_id,
     f.company_name,
     f.fiscal_year,
-    t.table_id,
-    t.section_id,
-    t.section_type,
-    t.statement_type,
-    t.table_role,
-    t.table_subrole,
-    t.title AS table_title,
-    t.unit AS table_unit,
-    r.row_id,
-    r.row_index,
-    r.raw_label,
-    r.normalized_label,
-    v.value_id,
-    v.col_index,
-    v.column_key,
-    v.period,
-    v.value_role,
-    v.value_numeric,
-    v.value_raw,
-    v.unit,
-    v.column_header_path,
-    v.is_primary_value
-FROM table_values v
-JOIN table_rows r ON v.row_id = r.row_id
-JOIN tables t ON v.table_id = t.table_id
-JOIN filings f ON t.filing_id = f.filing_id
+    m.table_id,
+    m.section_type,
+    m.statement_type,
+    m.table_role,
+    m.table_subrole,
+    m.table_title,
+    m.table_unit,
+    m.page_start,
+    m.page_end,
+    m.row_id,
+    m.row_index,
+    m.raw_label,
+    m.normalized_label,
+    m.value_id,
+    m.col_index,
+    m.column_key,
+    m.period,
+    m.value_role,
+    m.value_numeric,
+    m.value_raw,
+    m.unit,
+    m.column_header_path,
+    m.is_primary_value
+FROM metric_facts m
+JOIN filings f ON m.filing_id = f.filing_id
 """
 
     def build(self, interpretation: QueryInterpretation) -> Optional[SQLQueryPlan]:
@@ -68,10 +69,10 @@ JOIN filings f ON t.filing_id = f.filing_id
 
         where_clauses = [
             f"{self.LABEL_EXPR} IN ({self._placeholders(label_candidates)})",
-            "v.is_primary_value = 1",
-            "t.section_type = 'attached_financial_statements'",
-            "COALESCE(v.column_key, '') NOT LIKE '주석%'",
-            "COALESCE(v.column_key, '') NOT LIKE '주_석%'",
+            "m.is_primary_value = 1",
+            "m.section_type = 'attached_financial_statements'",
+            "COALESCE(m.column_key, '') NOT LIKE '주석%'",
+            "COALESCE(m.column_key, '') NOT LIKE '주 %'",
         ]
         params: List[Any] = list(label_candidates)
 
@@ -83,15 +84,15 @@ JOIN filings f ON t.filing_id = f.filing_id
             params.extend(list(interpretation.year_range))
 
         if statement_types:
-            where_clauses.append(f"t.statement_type IN ({self._placeholders(statement_types)})")
+            where_clauses.append(f"m.statement_type IN ({self._placeholders(statement_types)})")
             params.extend(statement_types)
 
         sql = (
             self.BASE_SELECT
             + "\nWHERE "
             + "\n  AND ".join(where_clauses)
-            + "\nORDER BY CASE WHEN t.table_role = 'financial_table' THEN 0 ELSE 1 END, "
-            + "f.fiscal_year DESC, t.table_id, r.row_index, v.col_index\nLIMIT ?"
+            + "\nORDER BY CASE WHEN m.table_role = 'financial_table' THEN 0 ELSE 1 END, "
+            + "f.fiscal_year DESC, m.table_id, m.row_index, m.col_index\nLIMIT ?"
         )
         params.append(interpretation.limit)
         return SQLQueryPlan(
@@ -135,10 +136,10 @@ WITH target_years AS (
 
         where_clauses = [
             f"{self.LABEL_EXPR} IN ({self._placeholders(label_candidates)})",
-            "v.is_primary_value = 1",
-            "t.section_type = 'attached_financial_statements'",
-            "COALESCE(v.column_key, '') NOT LIKE '주석%'",
-            "COALESCE(v.column_key, '') NOT LIKE '주_석%'",
+            "m.is_primary_value = 1",
+            "m.section_type = 'attached_financial_statements'",
+            "COALESCE(m.column_key, '') NOT LIKE '주석%'",
+            "COALESCE(m.column_key, '') NOT LIKE '주 %'",
             year_filter_sql,
         ]
         if cte:
@@ -147,7 +148,7 @@ WITH target_years AS (
             params = list(label_candidates) + list(year_params)
 
         if statement_types:
-            where_clauses.append(f"t.statement_type IN ({self._placeholders(statement_types)})")
+            where_clauses.append(f"m.statement_type IN ({self._placeholders(statement_types)})")
             params.extend(statement_types)
 
         sql = (
@@ -155,8 +156,8 @@ WITH target_years AS (
             + self.BASE_SELECT
             + "\nWHERE "
             + "\n  AND ".join(where_clauses)
-            + "\nORDER BY CASE WHEN t.table_role = 'financial_table' THEN 0 ELSE 1 END, "
-            + "f.fiscal_year ASC, t.table_id, r.row_index, v.col_index"
+            + "\nORDER BY CASE WHEN m.table_role = 'financial_table' THEN 0 ELSE 1 END, "
+            + "f.fiscal_year ASC, m.table_id, m.row_index, m.col_index"
         )
         return SQLQueryPlan(
             template_name="trend_compare",

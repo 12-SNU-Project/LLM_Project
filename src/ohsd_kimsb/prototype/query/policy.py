@@ -25,6 +25,8 @@ class QueryRoutingPolicy:
         if normalized.year_range is not None:
             normalized.year_range = tuple(sorted(normalized.year_range))
 
+        had_section_anchor = bool(normalized.section_candidates)
+
         # Keep the final route stable even if the upstream LLM drifts.
         if normalized.intent == QueryIntent.METRIC_LOOKUP:
             normalized.need_sql = True
@@ -42,6 +44,16 @@ class QueryRoutingPolicy:
         if normalized.intent in {QueryIntent.TEXT_EXPLANATION, QueryIntent.METRIC_WITH_EXPLANATION}:
             if not normalized.section_candidates:
                 normalized.section_candidates = list(DEFAULT_EXPLANATION_SECTIONS)
+
+        # Broad qualitative questions without a concrete section anchor should
+        # not drift into VDB-only answers; ask for a tighter metric/section.
+        if normalized.intent == QueryIntent.TEXT_EXPLANATION:
+            if not normalized.metric_candidates and not had_section_anchor:
+                normalized.need_sql = False
+                normalized.need_vdb = False
+                normalized.clarification_needed = True
+                normalized.clarification_reason = normalized.clarification_reason or "section_or_metric_required"
+                normalized.notes.append("clarification_required=section_or_metric_required")
 
         if normalized.intent == QueryIntent.TREND_COMPARE:
             if normalized.year_window is None and normalized.year_range is None:
