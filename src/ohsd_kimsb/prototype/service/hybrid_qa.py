@@ -11,6 +11,7 @@ try:
     from ..retrieval.schema import EvidenceBundle
     from ..support.answering.composer import LangChainAnswerComposer
     from ..support.answering.schema import GeneratedAnswer
+    from ..tools.ratio_tool import RatioAnalysisTool
 except ImportError:
     from query.interpreter import QueryInterpreter
     from query.sql_templates import SQLTemplateEngine
@@ -19,6 +20,7 @@ except ImportError:
     from retrieval.schema import EvidenceBundle
     from support.answering.composer import LangChainAnswerComposer
     from support.answering.schema import GeneratedAnswer
+    from tools.ratio_tool import RatioAnalysisTool
 
 
 class AuditQAService:
@@ -30,6 +32,7 @@ class AuditQAService:
         vector_store: VectorStoreProtocol,
         query_interpreter: Optional[QueryInterpreter] = None,
         evidence_organizer: Optional[EvidenceOrganizer] = None,
+        ratio_tool: Optional[RatioAnalysisTool] = None,
     ) -> None:
         self.sql_engine = sql_engine
         self.retrieval_engine = retrieval_engine
@@ -37,6 +40,7 @@ class AuditQAService:
         self.vector_store = vector_store
         self.query_interpreter = query_interpreter or QueryInterpreter()
         self.evidence_organizer = evidence_organizer or EvidenceOrganizer()
+        self.ratio_tool = ratio_tool or RatioAnalysisTool()
 
     def answer(self, question: str, conn: sqlite3.Connection):
         interpretation = self.query_interpreter.interpret(question)
@@ -57,8 +61,12 @@ class AuditQAService:
                 "answer": answer.to_dict(),
             }
 
-        sql_plan = self.sql_engine.build(interpretation)
-        sql_rows = self.sql_engine.execute(conn, sql_plan)
+        if self.ratio_tool.supports(interpretation):
+            sql_plan = self.ratio_tool.build_plan(interpretation)
+            sql_rows = self.ratio_tool.execute(conn, interpretation)
+        else:
+            sql_plan = self.sql_engine.build(interpretation)
+            sql_rows = self.sql_engine.execute(conn, sql_plan)
         bundle = self.retrieval_engine.retrieve(
             question=question,
             interpretation=interpretation,

@@ -58,7 +58,11 @@ class EvidenceOrganizer:
 
         reverse = interpretation.intent != QueryIntent.TREND_COMPARE
         deduped.sort(key=lambda row: self._sql_sort_key(row, interpretation), reverse=reverse)
-        return deduped[: self.max_sql_rows]
+        max_sql_rows = self.max_sql_rows
+        if interpretation.intent == QueryIntent.TREND_COMPARE:
+            metric_count = max(1, len(getattr(interpretation, "metric_candidates", []) or []))
+            max_sql_rows = max(self.max_sql_rows, interpretation.limit * metric_count)
+        return deduped[: max_sql_rows]
 
     def _sql_sort_key(self, row: Dict[str, Any], interpretation: Any) -> Tuple[Any, ...]:
         fiscal_year = row.get("fiscal_year") or 0

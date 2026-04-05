@@ -22,6 +22,8 @@ class ChromaMetadataBuilder:
         documents: List[ChromaChunkDocument] = []
 
         for chunk in getattr(parse_result, "text_chunks", []):
+            if getattr(chunk, "is_structural_chunk", False):
+                continue  # 구조 anchor 청크는 SQLite에만 남기고 VDB 본문 검색에서는 제외한다.
             start_block = block_by_id.get(chunk.start_block_id)
             end_block = block_by_id.get(chunk.end_block_id)
             near_table = table_by_id.get(chunk.near_table_id) if getattr(chunk, "near_table_id", None) else None
