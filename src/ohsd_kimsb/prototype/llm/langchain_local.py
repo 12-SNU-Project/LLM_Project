@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 @dataclass
 class LocalLLMConfig:
     provider: str = "ollama"
-    model: str = "qwen2.5:7b"
+    model: str = "qwen3:4b"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.0
     timeout: int = 120
