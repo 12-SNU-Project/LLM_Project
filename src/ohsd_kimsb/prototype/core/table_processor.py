@@ -379,6 +379,48 @@ class TableProcessor:
         text = re.sub(r"^[가-힣A-Za-z]\.\s*", "", text)
         return text.strip()
 
+    def _pick_row_label_cell(self, row_idx: int, row: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+        """Prefer a fresh row cell over a carried rowspan bucket label."""
+        label_cell = row[self.label_col_idx] if self.label_col_idx < len(row) else None
+        if label_cell and (label_cell["origin_row"], label_cell["origin_col"]) == (row_idx, self.label_col_idx):
+            if self._normalize_text(label_cell.get("text", "")):
+                return label_cell
+
+        # Related-party tables often keep `종속기업` in a rowspan cell and place
+        # the actual company name in the next column on the current row.
+        origin_cells = [
+            cell
+            for cell in self._unique_cells_in_row(row)
+            if cell
+            and cell.get("origin_row") == row_idx
+            and self._normalize_text(cell.get("text", ""))
+            and not self._is_numeric_text(self._normalize_text(cell.get("text", "")))
+        ]
+        if origin_cells:
+            return origin_cells[0]
+
+        return next(
+            (
+                cell
+                for cell in self._unique_cells_in_row(row)
+                if self._normalize_text(cell.get("text", ""))
+                and not self._is_numeric_text(self._normalize_text(cell.get("text", "")))
+            ),
+            None,
+        )
+
+    def _extract_group_labels(self, row_idx: int, row: List[Optional[Dict[str, Any]]]) -> List[str]:
+        """Keep carried group labels for debugging without using them as row keys."""
+        labels: List[str] = []
+        for cell in self._unique_cells_in_row(row):
+            if not cell or cell.get("origin_row") == row_idx:
+                continue
+            text = self._normalize_text(cell.get("text", ""))
+            if not text or self._is_numeric_text(text) or text in labels:
+                continue
+            labels.append(text)
+        return labels
+
     def _build_row_hierarchy(
         self,
         grid: List[List[Optional[Dict[str, Any]]]],
@@ -393,19 +435,13 @@ class TableProcessor:
             if row_idx in header_row_set or self._is_row_empty(row):
                 continue
 
-            label_cell = row[self.label_col_idx] if self.label_col_idx < len(row) else None
-            if label_cell and (label_cell["origin_row"], label_cell["origin_col"]) != (row_idx, self.label_col_idx):
-                label_cell = None
-            if not label_cell or not self._normalize_text(label_cell.get("text", "")):
-                label_cell = next(
-                    (cell for cell in self._unique_cells_in_row(row) if self._normalize_text(cell.get("text", ""))),
-                    None,
-                )
+            label_cell = self._pick_row_label_cell(row_idx, row)
             if not label_cell:
                 continue
 
             raw_label = label_cell.get("text", "")
             raw_label_with_indent = label_cell.get("raw_text", raw_label)
+            group_labels = self._extract_group_labels(row_idx, row)
             is_section_header = self._is_section_header(row, raw_label)
             if is_section_header:
                 row_depth = 0
@@ -424,6 +460,10 @@ class TableProcessor:
                 row_depth=row_depth,
                 parent_row_id=parent_row_id,
                 is_section_header=is_section_header,
+                metadata={
+                    "group_labels": group_labels,
+                    "group_label": group_labels[-1] if group_labels else None,
+                },
             )
             row_map[row_idx] = row_obj
             rows.append(row_obj)

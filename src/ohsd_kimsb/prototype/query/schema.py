@@ -19,6 +19,7 @@ class QueryInterpretation:
     raw_question: str
     intent: QueryIntent
     metric_candidates: List[str] = field(default_factory=list)
+    row_label_filters: List[str] = field(default_factory=list)
     year: Optional[int] = None
     year_range: Optional[Tuple[int, int]] = None
     year_window: Optional[int] = None
@@ -46,6 +47,7 @@ class QueryInterpretation:
             raw_question=raw_question or str(payload.get("raw_question", "")),
             intent=QueryIntent(str(payload["intent"])),
             metric_candidates=[str(item) for item in payload.get("metric_candidates", [])],
+            row_label_filters=[str(item) for item in payload.get("row_label_filters", [])],
             year=int(payload["year"]) if payload.get("year") is not None else None,
             year_range=year_range,
             year_window=int(payload["year_window"]) if payload.get("year_window") is not None else None,
@@ -81,6 +83,10 @@ INTERPRETATION_JSON_SCHEMA: Dict[str, Any] = {
             "enum": [intent.value for intent in QueryIntent],
         },
         "metric_candidates": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "row_label_filters": {
             "type": "array",
             "items": {"type": "string"},
         },

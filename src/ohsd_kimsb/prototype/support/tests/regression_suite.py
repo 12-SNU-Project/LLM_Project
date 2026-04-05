@@ -119,11 +119,7 @@ def run() -> Dict[str, Any]:
     _check(runtime.runtime_report.get("preferred_intent_model") == "qwen3:8b", "runtime: intent model default mismatch", failures)
     _check(runtime.runtime_report.get("preferred_answer_model") == "qwen3:8b", "runtime: answer model default mismatch", failures)
     _check(runtime.runtime_report.get("preferred_embedding_model") == "qwen3-embedding:8b", "runtime: embedding model default mismatch", failures)
-    _check(
-        runtime.runtime_report.get("vector_backend") in {"chroma", "in_memory"},
-        "runtime: vector backend missing",
-        failures,
-    )
+    _check(runtime.runtime_report.get("vector_backend") in {"chroma", "in_memory"}, "runtime: vector backend missing", failures)
 
     sql_engine = SQLTemplateEngine()
     retrieval_engine = RetrievalFusionEngine(metadata_builder=runtime.metadata_builder)
@@ -171,6 +167,22 @@ def run() -> Dict[str, Any]:
             "expect_vdb": False,
             "clarification_needed": True,
         },
+        {
+            "question": "이 회사는 잘될 회사야? 아니면 망할 회사야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": False,
+            "expect_vdb": False,
+            "clarification_needed": True,
+        },
+        {
+            "question": "2024년 Samsung Semiconductor, Inc. (SSI) 종속기업과의 revenue는 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Semiconductor, Inc. (SSI)",
+            "expect_column_key_fragment": "매출",
+        },
     ]
 
     query_summary: List[Dict[str, Any]] = []
@@ -210,6 +222,22 @@ def run() -> Dict[str, Any]:
             if interpretation["intent"] == "trend_compare" and not interpretation["clarification_needed"]:
                 years = {row.get("fiscal_year") for row in bundle["sql_results"] if row.get("fiscal_year") is not None}
                 _check(len(years) >= 3, "trend_compare query: fewer than 3 fiscal years returned", failures)
+
+            expected_row_label_fragment = case.get("expect_row_label_fragment")
+            if expected_row_label_fragment:
+                _check(
+                    any(expected_row_label_fragment in (row.get("raw_label") or "") for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected row label fragment missing",
+                    failures,
+                )
+
+            expected_column_key_fragment = case.get("expect_column_key_fragment")
+            if expected_column_key_fragment:
+                _check(
+                    any(expected_column_key_fragment in (row.get("column_key") or "") for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected column key fragment missing",
+                    failures,
+                )
 
             if interpretation["clarification_needed"]:
                 _check(

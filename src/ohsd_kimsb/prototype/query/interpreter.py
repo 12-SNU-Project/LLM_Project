@@ -18,7 +18,13 @@ from .schema import INTERPRETATION_JSON_SCHEMA, QueryIntent, QueryInterpretation
 
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 YEAR_WINDOW_RE = re.compile(r"(?:최근|최신)\s*(\d+)\s*개년")
-EXPLANATION_KEYWORDS = ("설명", "의견", "원인", "배경", "근거", "내용", "주석", "관련")
+ENTITY_NAME_RE = re.compile(
+    r"([A-Z][A-Za-z0-9&.,\-]*"
+    r"(?:\s+[A-Z][A-Za-z0-9&.,\-]*)*"
+    r"\s+(?:Inc\.|Ltd\.|LLC\.?|Corp\.|GmbH|ApS|Kft|OOO|SAS|Co\., Ltd\.|Co\. Ltd\.|Co\.)"
+    r"\s*(?:\([A-Z0-9]{2,8}\))?)"
+)
+EXPLANATION_KEYWORDS = ("설명", "의견", "이유", "배경", "근거", "내용", "주석", "관련")
 TREND_KEYWORDS = ("추이", "흐름", "비교", "변화", "증가", "감소", "최근")
 
 
@@ -28,11 +34,12 @@ class QueryInterpreter:
 
     def build_llm_instruction(self) -> str:
         return (
-            "사용자 질문을 구조화된 질의 해석 JSON으로 변환하라. "
-            "지원 intent는 metric_lookup, text_explanation, metric_with_explanation, trend_compare 네 가지뿐이다. "
-            "SQL은 직접 생성하지 말고, 아래 JSON schema에 맞춰 intent와 슬롯만 채워라. "
-            "RDB는 수치/연도/추이 조회에 쓰고, VDB는 설명 문단/감사의견/주석 설명에 쓴다. "
-            "질문이 너무 추상적이거나 metric이 없으면 clarification_needed=true와 clarification_reason을 채워라.\n"
+            "사용자 질문을 구조화된 질의 해석 JSON으로 변환하세요. "
+            "intent는 metric_lookup, text_explanation, metric_with_explanation, trend_compare 중 하나만 허용됩니다. "
+            "SQL을 직접 만들지 말고, metric_candidates / row_label_filters / year / section_candidates / "
+            "need_sql / need_vdb / clarification_needed 만 채우세요. "
+            "RDB는 숫자/연도/추이 조회, VDB는 설명 문단/감사의견/주석 조회에 사용됩니다. "
+            "질문이 너무 추상적이면 clarification_needed=true 와 clarification_reason을 채우세요.\n"
             f"{json.dumps(INTERPRETATION_JSON_SCHEMA, ensure_ascii=False, indent=2)}"
         )
 
@@ -41,6 +48,7 @@ class QueryInterpreter:
             payload = json.loads(payload)
         interpretation = QueryInterpretation.from_dict(payload, raw_question=raw_question)
         interpretation.metric_candidates = self._canonicalize_metrics(interpretation.metric_candidates)
+        interpretation.row_label_filters = self._canonicalize_row_label_filters(interpretation.row_label_filters)
         interpretation.section_candidates = self._canonicalize_sections(interpretation.section_candidates)
         return interpretation
 
@@ -65,6 +73,7 @@ class QueryInterpreter:
             raw_question=structured.raw_question or fallback.raw_question,
             intent=structured.intent,
             metric_candidates=structured.metric_candidates or fallback.metric_candidates,
+            row_label_filters=structured.row_label_filters or fallback.row_label_filters,
             year=structured.year if structured.year is not None else fallback.year,
             year_range=structured.year_range or fallback.year_range,
             year_window=structured.year_window if structured.year_window is not None else fallback.year_window,
@@ -82,6 +91,7 @@ class QueryInterpreter:
     def _interpret_with_rules(self, question: str) -> QueryInterpretation:
         compact_question = compact_token(question)
         metrics = self._detect_metrics(compact_question)
+        row_label_filters = self._detect_row_label_filters(question)
         sections = self._detect_sections(compact_question)
         years = [int(match.group(1)) for match in YEAR_RE.finditer(question)]
         year = years[0] if len(years) == 1 else None
@@ -114,13 +124,20 @@ class QueryInterpreter:
             sections = list(DEFAULT_EXPLANATION_SECTIONS)
 
         notes: List[str] = []
-        if not metrics and intent in {QueryIntent.METRIC_LOOKUP, QueryIntent.METRIC_WITH_EXPLANATION, QueryIntent.TREND_COMPARE}:
+        if not metrics and intent in {
+            QueryIntent.METRIC_LOOKUP,
+            QueryIntent.METRIC_WITH_EXPLANATION,
+            QueryIntent.TREND_COMPARE,
+        }:
             notes.append("metric_candidates_empty")
+        if row_label_filters:
+            notes.append("row_label_filter_detected")
 
         return QueryInterpretation(
             raw_question=question,
             intent=intent,
             metric_candidates=metrics,
+            row_label_filters=row_label_filters,
             year=year,
             year_range=year_range,
             year_window=year_window,
@@ -153,12 +170,37 @@ class QueryInterpreter:
                         matches.append(section_type)
         return matches
 
+    @staticmethod
+    def _detect_row_label_filters(question: str) -> List[str]:
+        matches: List[str] = []
+
+        for match in re.finditer(r"[\"']([^\"']{3,120})[\"']", question):
+            candidate = match.group(1).strip()
+            if candidate and candidate not in matches:
+                matches.append(candidate)
+
+        for match in ENTITY_NAME_RE.finditer(question):
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" ,")
+            if candidate and candidate not in matches:
+                matches.append(candidate)
+
+        return matches
+
     def _canonicalize_metrics(self, metrics: Iterable[str]) -> List[str]:
         result: List[str] = []
         for metric in metrics:
             canonical = METRIC_ALIAS_TO_ID.get(compact_token(metric), metric)
             if canonical in METRIC_DEFINITIONS and canonical not in result:
                 result.append(canonical)
+        return result
+
+    @staticmethod
+    def _canonicalize_row_label_filters(filters: Iterable[str]) -> List[str]:
+        result: List[str] = []
+        for value in filters:
+            normalized = re.sub(r"\s+", " ", (value or "")).strip()
+            if normalized and normalized not in result:
+                result.append(normalized)
         return result
 
     def _canonicalize_sections(self, sections: Iterable[str]) -> List[str]:
