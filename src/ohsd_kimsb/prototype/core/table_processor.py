@@ -53,6 +53,13 @@ class TableProcessor:
     LABEL_COLUMN_KEYWORDS = ("과목", "구분", "기업명", "내역", "항목", "종류")
     PERIOD_KEYWORDS = ("당기", "전기", "당기말", "전기말", "기말", "기초", "반기", "분기")
 
+    SEMANTIC_TABLE_KEYWORDS = {
+        "subsidiary_status_table": ("종속기업의현황", "종속기업현황", "지분율"),
+        "related_party_transaction_table": ("특수관계자와의매출ㆍ매입등거래내역", "특수관계자와의매출매입등거래내역"),
+        "related_party_balance_table": ("특수관계자에대한채권ㆍ채무등잔액", "특수관계자에대한채권채무등잔액"),
+        "subsidiary_summary_financial_table": ("주요종속기업", "요약재무정보"),
+    }
+
     def __init__(
         self,
         block: Block,
@@ -607,6 +614,153 @@ class TableProcessor:
             return "unknown_table", "quant_table"
         return "unknown_table", "layout_table"
 
+    @staticmethod
+    def _looks_like_entity_label(text: str) -> bool:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        return bool(
+            re.search(r"(Inc\.|Ltd\.|LLC\.?|Corp\.|GmbH|ApS|Kft|OOO|SAS|\([A-Z0-9]{2,8}\)|㈜|주식회사)", compact)
+        )
+
+    @classmethod
+    def _looks_like_continuation_title(cls, title: Optional[str]) -> bool:
+        """`2) 전기`처럼 앞 표를 이어 받는 짧은 제목인지 판별한다."""
+        if not title:
+            return True
+        compact = cls._compact_text(title)
+        if not compact:
+            return True
+        return bool(
+            re.fullmatch(r"\(?\d+\)?(?:전기|당기|전기말|당기말)?", compact)
+            or re.fullmatch(r"\(?[가-힣A-Za-z]\)?(?:전기|당기|전기말|당기말)?", compact)
+        )
+
+    @classmethod
+    def _looks_like_summary_financial_header(cls, header_text: str) -> bool:
+        """요약 재무정보 표의 전형적인 열 조합인지 느슨하게 본다."""
+        hits = sum(
+            1
+            for keyword in ("자산", "부채", "매출액", "당기순이익", "순이익")
+            if keyword in header_text
+        )
+        return hits >= 3
+
+    def _infer_semantic_table_type(
+        self,
+        title: Optional[str],
+        table_role: str,
+        table_subrole: Optional[str],
+        col_headers: Dict[int, Dict[str, Any]],
+        rows: List[TableRow],
+    ) -> str:
+        title_signal = self._compact_text(" ".join(part for part in (self.block.section_title or "", title or "") if part))
+        context_signal = self._compact_text(self.context_before or "")
+        header_text = self._compact_text(
+            " ".join(" ".join(info.get("header_path", [])) for info in col_headers.values())
+        )
+        row_labels = [row.raw_label for row in rows if row.raw_label]
+        entity_like_rows = sum(1 for label in row_labels if self._looks_like_entity_label(label))
+
+        if table_role == "financial_table":
+            return "primary_financial_statement"  # 본표는 항상 최우선 의미로 고정
+        if table_role == "internal_control_table":
+            return "internal_control_table"
+        if table_role == "cover_table":
+            return "cover_information_table"
+
+        if any(keyword in title_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_transaction_table"]):
+            return "subsidiary_status_table"  # 종속기업 현황/지분율 표
+        if any(keyword in signal_text for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_transaction_table"]):
+            return "related_party_transaction_table"  # 특수관계자 거래 표
+        if any(keyword in signal_text for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_balance_table"]):
+            return "related_party_balance_table"  # 특수관계자 채권/채무 잔액 표
+
+        if "요약재무정보" in signal_text and ("종속기업" in signal_text or entity_like_rows >= 3):
+            return "subsidiary_summary_financial_table"  # 종속기업 요약 재무정보 표
+        if "요약재무정보" in signal_text:
+            return "investee_summary_financial_table"  # 관계기업/공동기업 요약 재무정보 표
+
+        if table_subrole == "note_quant_table":
+            # 기업명 행이 다수이면 일반 주석 수치표보다 실체별 세부표일 가능성이 높다.
+            if entity_like_rows >= 3 and ("기업명" in header_text or "구분" in header_text):
+                return "entity_note_quant_table"
+            return "note_general_numeric_table"
+        if table_subrole in {"note_layout_table", "layout_table"}:
+            return "note_general_layout_table"
+        if table_subrole in {"narrative_notice", "cover_notice"}:
+            return "narrative_notice_table"
+        return "generic_numeric_table"
+
+    def _infer_semantic_table_type_v2(
+        self,
+        title: Optional[str],
+        table_role: str,
+        table_subrole: Optional[str],
+        col_headers: Dict[int, Dict[str, Any]],
+        rows: List[TableRow],
+    ) -> str:
+        """회계 의미 기준의 표 분류. 기존 role/subrole 위에 한 층 더 올린다."""
+        title_signal = self._compact_text(" ".join(part for part in (self.block.section_title or "", title or "") if part))
+        context_signal = self._compact_text(self.context_before or "")
+        header_text = self._compact_text(
+            " ".join(" ".join(info.get("header_path", [])) for info in col_headers.values())
+        )
+        row_labels = [row.raw_label for row in rows if row.raw_label]
+        entity_like_rows = sum(1 for label in row_labels if self._looks_like_entity_label(label))
+        continuation_title = self._looks_like_continuation_title(title)
+
+        if table_role == "financial_table":
+            return "primary_financial_statement"  # 본표는 항상 최우선 의미로 본다.
+        if table_role == "internal_control_table":
+            return "internal_control_table"
+        if table_role == "cover_table":
+            return "cover_information_table"
+
+        if any(keyword in title_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_transaction_table"]):
+            return "related_party_transaction_table"  # 제목이 거래 내역을 직접 가리킴
+        if "매출등" in header_text and "매입등" in header_text and entity_like_rows >= 3:
+            return "related_party_transaction_table"  # (2) 전기처럼 제목이 짧아도 헤더로 복원
+
+        if any(keyword in title_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_balance_table"]):
+            return "related_party_balance_table"  # 제목이 잔액표를 직접 가리킴
+        if "채권등" in header_text and "채무등" in header_text and entity_like_rows >= 3:
+            return "related_party_balance_table"  # 이어지는 전기말 표도 헤더로 복원
+
+        if any(keyword in title_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["subsidiary_status_table"]):
+            return "subsidiary_status_table"  # 종속기업 현황/지분율 표
+        if "지분율" in header_text and entity_like_rows >= 3:
+            return "subsidiary_status_table"
+
+        if "요약재무정보" in title_signal and ("종속기업" in title_signal or entity_like_rows >= 3):
+            return "subsidiary_summary_financial_table"  # 종속기업 요약 재무정보 표
+        if "요약재무정보" in title_signal:
+            return "investee_summary_financial_table"  # 관계기업/공동기업 요약 재무정보 표
+
+        # 제목이 `2) 전기`처럼 짧은 후속 표라도, 직전 문맥이 요약재무정보를 가리키고
+        # 헤더가 자산/부채/매출액/순이익 축이면 앞 표의 의미를 그대로 상속한다.
+        if continuation_title and "요약재무정보" in context_signal and self._looks_like_summary_financial_header(header_text):
+            if "종속기업" in context_signal or entity_like_rows >= 3:
+                return "subsidiary_summary_financial_table"  # 종속기업 요약표의 연속 페이지
+            return "investee_summary_financial_table"  # 투자회사 요약표의 연속 페이지
+
+        # 제목이 비어 있는 후속 페이지는 직전 문맥을 마지막 보조 신호로만 사용한다.
+        if any(keyword in context_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_transaction_table"]):
+            return "related_party_transaction_table"
+        if any(keyword in context_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["related_party_balance_table"]):
+            return "related_party_balance_table"
+        if any(keyword in context_signal for keyword in self.SEMANTIC_TABLE_KEYWORDS["subsidiary_status_table"]):
+            return "subsidiary_status_table"
+
+        if table_subrole == "note_quant_table":
+            # 기업명 행이 다수면 일반 합계표보다 실체별 세부표일 가능성이 높다.
+            if entity_like_rows >= 3 and ("기업명" in header_text or "구분" in header_text):
+                return "entity_note_quant_table"
+            return "note_general_numeric_table"
+        if table_subrole in {"note_layout_table", "layout_table"}:
+            return "note_general_layout_table"
+        if table_subrole in {"narrative_notice", "cover_notice"}:
+            return "narrative_notice_table"
+        return "generic_numeric_table"
+
     def _infer_statement_type(self, title: Optional[str]) -> Optional[str]:
         if not title:
             return None
@@ -762,6 +916,13 @@ class TableProcessor:
         row_map, rows = self._build_row_hierarchy(raw_grid, header_rows)
         title, unit, year_candidates = self._extract_table_title_unit_years(raw_grid, col_headers)
         table_role, table_subrole = self._classify_table(raw_grid, title)
+        semantic_table_type = self._infer_semantic_table_type_v2(
+            title=title,
+            table_role=table_role,
+            table_subrole=table_subrole,
+            col_headers=col_headers,
+            rows=rows,
+        )
         statement_type = self._infer_statement_type(title)
         cells, values = self._build_cells_and_values(raw_grid, col_headers, row_map, unit)
 
@@ -772,6 +933,7 @@ class TableProcessor:
             statement_type=statement_type,
             table_role=table_role,
             table_subrole=table_subrole,
+            semantic_table_type=semantic_table_type,
             title=title,
             unit=unit,
             year_candidates=year_candidates,

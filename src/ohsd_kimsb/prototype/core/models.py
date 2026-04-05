@@ -117,6 +117,7 @@ class NormalizedTable:
     statement_type: Optional[str] = None
     table_role: str = "unknown_table" # cover_table | financial_table | internal_control_table | unknown_table
     table_subrole: Optional[str] = None
+    semantic_table_type: Optional[str] = None
     title: Optional[str] = None
     unit: Optional[str] = None
     year_candidates: List[int] = field(default_factory=list)

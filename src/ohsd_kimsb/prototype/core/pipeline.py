@@ -320,6 +320,7 @@ class AuditReportPipeline:
                         "statement_type": table.statement_type,
                         "table_role": table.table_role,
                         "table_subrole": table.table_subrole,
+                        "semantic_table_type": table.semantic_table_type,
                         "table_title": table.title,
                         "table_unit": table.unit,
                         "page_start": table.page_start,
@@ -328,6 +329,7 @@ class AuditReportPipeline:
                         "row_index": row.row_index,
                         "raw_label": row.raw_label,
                         "normalized_label": row.normalized_label,
+                        "row_group_label": row.metadata.get("group_label"),
                         "col_index": value.col_index,
                         "column_key": value.column_key,
                         "period": value.period,
@@ -387,6 +389,7 @@ class AuditReportPipeline:
             lines.append(f"### {table.table_id} | {table.title or 'Untitled'}")
             lines.append(f"- role: {table.table_role}")
             lines.append(f"- subrole: {table.table_subrole}")
+            lines.append(f"- semantic: {table.semantic_table_type}")
             lines.append(f"- statement_type: {table.statement_type}")
             lines.append(f"- unit: {table.unit}")
             lines.append(f"- years: {table.year_candidates}")

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS metric_facts (
     statement_type           VARCHAR(80),
     table_role               VARCHAR(80) NOT NULL,
     table_subrole            VARCHAR(80),
+    semantic_table_type      VARCHAR(80),
     table_title              TEXT,
     table_unit               VARCHAR(80),
     page_start               INTEGER,
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS metric_facts (
     row_index                INTEGER NOT NULL,
     raw_label                TEXT NOT NULL,
     normalized_label         TEXT,
+    row_group_label          VARCHAR(120),
     col_index                INTEGER NOT NULL,
     column_key               VARCHAR(160) NOT NULL,
     period                   VARCHAR(80),
@@ -62,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_metric_facts_filing ON metric_facts(filing_id);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_year ON metric_facts(fiscal_year);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_table ON metric_facts(table_id);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_role ON metric_facts(table_role, table_subrole);
+CREATE INDEX IF NOT EXISTS idx_metric_facts_semantic ON metric_facts(semantic_table_type);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_statement ON metric_facts(statement_type);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_label ON metric_facts(normalized_label, raw_label);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_column_key ON metric_facts(column_key);
