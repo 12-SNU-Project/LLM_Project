@@ -31,15 +31,12 @@ HTML 파싱과 기본적인 데이터 파이프라인 구성을 토대로, CI/CD
 ## 📁 프로젝트 구조 (업데이트)
 ```
 📦 root
-├── 📂 prototype/                 # Streamlit 프로토타입
-│   └── app.py                    # 메인 Streamlit 앱 
 │
 ├── 📂 src/                       # 소스코드
-│   ├── 📂 승담_수비/   
-│   ├── 📂 민환_주영/
-│   └── 📂 현서_재민/
+│   ├── 📂 ohsd_kimsb/   
+│   ├── 📂 leemh_ohjy/
+│   └── 📂 parkhs_hajm/
 ├── 📂 data/                      # 감사 보고서 문서
-├── 📂 docs/                      # 프로젝트 문서
 │
 ├──  과제문서.ipynb
 ├── .gitignore
