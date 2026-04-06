@@ -12,7 +12,7 @@
 1. HTML을 먼저 markdown으로 바꾸지 않는다.
 2. DOM/블록 구조를 보존한 뒤, 표와 본문을 따로 정규화한다.
 3. 숫자는 SQL projection으로 찾고, 표 구조는 `tables_registry`/`table_rows`로 보강한다.
-4. 1차 검색 후 `EvidenceExpansionPlanner`가 근거 부족 축을 판정하고, 필요 시 `tables_registry`의 표 markdown/footnotes와 `table_rows`의 행 구조를 추가 근거로 붙인다.
+4. 1차 검색 후 `Evid[PROJECT.md](PROJECT.md)enceExpansionPlanner`가 근거 부족 축을 판정하고, 필요 시 `tables_registry`의 표 markdown/footnotes와 `table_rows`의 행 구조를 추가 근거로 붙인다.
 5. LLM은 자유롭게 SQL을 만드는 agent가 아니라, 질의 분류기와 evidence 기반 응답 생성기로 역할을 제한한다.
 
 ## 운영 방식
