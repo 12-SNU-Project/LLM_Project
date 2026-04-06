@@ -496,6 +496,28 @@ def run() -> Dict[str, Any]:
             "expect_semantic_table_type": "related_party_transaction_table",
         },
         {
+            "question": "2024년 Samsung Electronics (UK) Ltd의 채권은 얼마야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Electronics (UK) Ltd",
+            "expect_column_key_fragment": "채권",
+            "expect_semantic_table_type": "related_party_balance_table",
+            "expect_value_raw": "93,808",
+        },
+        {
+            "question": "2024년 Samsung Electronics (UK) Ltd는 종속기업이야 관계기업이야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Electronics (UK) Ltd",
+            "expect_semantic_table_type": "subsidiary_status_table",
+            "expect_company_kind": "subsidiary",
+            "expect_answer_fragment": "종속기업",
+        },
+        {
             "question": "2019년 주요 종속기업 요약 재무정보에서 Samsung Semiconductor, Inc.(SSI)의 매출액은 얼마야?",
             "expected_intent": "metric_lookup",
             "expect_sql": True,
@@ -701,6 +723,14 @@ def run() -> Dict[str, Any]:
                     failures,
                 )
 
+            expected_company_kind = case.get("expect_company_kind")
+            if expected_company_kind:
+                _check(
+                    any((row.get("company_kind") or "") == expected_company_kind for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected company_kind missing",
+                    failures,
+                )
+
             expected_value_raw = case.get("expect_value_raw")
             if expected_value_raw:
                 _check(
@@ -744,6 +774,14 @@ def run() -> Dict[str, Any]:
                 _check(
                     len(answer["citations"]) == len(bundle["citations"]),
                     f"query `{case['question']}`: answer citations mismatch",
+                    failures,
+                )
+
+            expected_answer_fragment = case.get("expect_answer_fragment")
+            if expected_answer_fragment:
+                _check(
+                    expected_answer_fragment in (answer.get("answer_text") or ""),
+                    f"query `{case['question']}`: expected answer fragment missing",
                     failures,
                 )
 

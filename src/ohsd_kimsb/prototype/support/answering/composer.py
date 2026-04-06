@@ -65,6 +65,8 @@ class LangChainAnswerComposer:
                 "semantic_table_type": row.get("semantic_table_type"),
                 "normalized_label": row.get("normalized_label"),
                 "raw_label": row.get("raw_label"),
+                "company_kind": row.get("company_kind"),
+                "row_group_label": row.get("row_group_label"),
                 "column_key": row.get("column_key"),
                 "period": row.get("period"),
                 "value_numeric": row.get("value_numeric"),
@@ -132,8 +134,32 @@ class LangChainAnswerComposer:
     ) -> str:
         lines: List[str] = []
         structure_requested = "structure" in bundle.evidence_requirements
+        classification_requested = any(
+            token in (bundle.interpretation.raw_question or "")
+            for token in ("종속기업", "관계기업", "공동기업")
+        )
         if sql_rows:
-            if bundle.interpretation.intent.value == "comparison_list_lookup":
+            if classification_requested:
+                kinds = []
+                for row in sql_rows:
+                    kind = str(row.get("company_kind") or "").strip()
+                    if kind and kind not in kinds:
+                        kinds.append(kind)
+                if kinds:
+                    label_map = {
+                        "subsidiary": "종속기업",
+                        "associate": "관계기업",
+                        "joint_venture": "공동기업",
+                    }
+                    name = sql_rows[0].get("raw_label") or sql_rows[0].get("normalized_label") or "해당 회사"
+                    if len(kinds) == 1:
+                        lines.append(f"직답 응답: {name}는 {label_map.get(kinds[0], kinds[0])}입니다.")
+                    else:
+                        labels = ", ".join(label_map.get(kind, kind) for kind in kinds)
+                        lines.append(f"직답 응답: {name}는 표 맥락에 따라 {labels}로 나타납니다.")
+                else:
+                    lines.append("직답 응답: 회사 분류를 판단할 직접 근거가 부족합니다.")
+            elif bundle.interpretation.intent.value == "comparison_list_lookup":
                 items: List[str] = []
                 for row in sql_rows[:8]:
                     name = row.get("raw_label") or row.get("normalized_label") or "항목"
@@ -172,15 +198,29 @@ class LangChainAnswerComposer:
                 else:
                     lines.append("직답 응답: 관련 표는 찾았지만 구성 항목을 정리하기엔 근거가 부족합니다.")
             elif bundle.interpretation.intent.value == "table_cell_lookup" and len(sql_rows) > 1:
-                items: List[str] = []
-                for row in sql_rows[:8]:
-                    label = row.get("raw_label") or row.get("normalized_label") or "항목"
-                    period = row.get("period")
-                    value = row.get("value_raw") or row.get("value_numeric")
-                    unit = row.get("unit") or ""
-                    prefix = label if not period or period in label else f"{label}({period})"
-                    items.append(f"{prefix}: {value}{(' ' + unit) if unit else ''}")
-                lines.append(f"직답 응답: {', '.join(items)} 입니다.")
+                unique_targets = {
+                    (
+                        row.get("raw_label") or row.get("normalized_label") or "",
+                        row.get("column_key") or "",
+                    )
+                    for row in sql_rows
+                }
+                if len(unique_targets) == 1:
+                    top = sql_rows[0]
+                    lines.append(
+                        f"직답 응답: {top.get('fiscal_year')}년 {top.get('raw_label') or top.get('normalized_label')}의 "
+                        f"{top.get('column_key')} 값은 {top.get('value_raw')} {top.get('unit') or ''} 입니다."
+                    )
+                else:
+                    items: List[str] = []
+                    for row in sql_rows[:8]:
+                        label = row.get("raw_label") or row.get("normalized_label") or "항목"
+                        period = row.get("period")
+                        value = row.get("value_raw") or row.get("value_numeric")
+                        unit = row.get("unit") or ""
+                        prefix = label if not period or period in label else f"{label}({period})"
+                        items.append(f"{prefix}: {value}{(' ' + unit) if unit else ''}")
+                    lines.append(f"직답 응답: {', '.join(items)} 입니다.")
             else:
                 top = sql_rows[0]
                 lines.append(

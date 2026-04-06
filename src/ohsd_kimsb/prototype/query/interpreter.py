@@ -19,9 +19,9 @@ from .schema import INTERPRETATION_JSON_SCHEMA, QueryIntent, QueryInterpretation
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 YEAR_WINDOW_RE = re.compile(r"(?:최근|최신)\s*(\d+)\s*개년")
 ENTITY_NAME_RE = re.compile(
-    r"([A-Z][A-Za-z0-9&.,\-]*"
-    r"(?:\s+[A-Z][A-Za-z0-9&.,\-]*)*"
-    r"\s+(?:Inc\.|Ltd\.|LLC\.?|Corp\.|GmbH|ApS|Kft|OOO|SAS|Co\., Ltd\.|Co\. Ltd\.|Co\.)"
+    r"((?:[A-Z][A-Za-z0-9&.,\-]*|\([A-Za-z0-9&.,\-]+\))"
+    r"(?:\s+(?:[A-Z][A-Za-z0-9&.,\-]*|\([A-Za-z0-9&.,\-]+\)))*"
+    r"\s+(?:Inc\.?|Ltd\.?|LLC\.?|Corp\.?|GmbH|ApS|Kft|OOO|SAS|Co\.,?\s*Ltd\.?|Co\.?\s*Ltd\.?|Co\.?)"
     r"\s*(?:\([A-Z0-9]{2,8}\))?)"
 )
 EXPLANATION_KEYWORDS = ("설명", "근거", "이유", "배경", "무엇", "의견", "주석")
@@ -53,6 +53,13 @@ ROW_LABEL_ALIASES = {
     # 사용자는 표의 원문 표현보다 짧게 묻는 경우가 많아서 자주 쓰는 축약어만 별도로 맞춰준다.
     "임금상승률": "미래임금상승률",
     "미래임금상승률": "미래임금상승률",
+}
+COLUMN_ALIASES = {
+    "채권": "채권 등",
+    "채무": "채무 등",
+    "매출": "매출 등",
+    "매입": "매입 등",
+    "지분": "지분율",
 }
 COLUMN_CANDIDATES = (
     "지분율",
@@ -183,6 +190,7 @@ class QueryInterpreter:
         row_label_terms = self._detect_keyword_terms(question, ROW_LABEL_CANDIDATES)
         row_label_terms = self._expand_row_label_aliases(question, row_label_terms)
         column_terms = self._detect_keyword_terms(question, COLUMN_CANDIDATES)
+        column_terms = self._expand_column_aliases(question, column_terms)
         table_title_terms = self._detect_keyword_terms(question, TABLE_TITLE_CANDIDATES)
         sections = self._detect_sections(compact_question)
         years = [int(match.group(1)) for match in YEAR_RE.finditer(question)]
@@ -200,7 +208,9 @@ class QueryInterpreter:
         )
         asks_structure = any(keyword in question for keyword in STRUCTURE_KEYWORDS)
         asks_list = any(keyword in question for keyword in LIST_KEYWORDS)
-        has_table_cell_anchor = bool(row_label_terms or column_terms or table_title_terms)  # 행/열/표 제목 축이 보이면 셀 질의로 본다.
+        has_table_cell_anchor = bool(
+            row_label_filters or row_label_terms or column_terms or table_title_terms
+        )  # 회사명/행/열/표 제목 축이 보이면 셀 질의로 본다.
         has_comparison_anchor = bool(
             comparison_operator and threshold_value is not None and (column_terms or table_title_terms or entity_scope)
         )
@@ -313,6 +323,14 @@ class QueryInterpreter:
         return matches
 
     @staticmethod
+    def _expand_column_aliases(question: str, detected_terms: List[str]) -> List[str]:
+        matches = list(detected_terms)
+        for alias, canonical in COLUMN_ALIASES.items():
+            if alias in question and canonical not in matches:
+                matches.append(canonical)
+        return matches
+
+    @staticmethod
     def _detect_period(question: str) -> Optional[str]:
         for canonical, variants in PERIOD_PATTERNS:
             if any(variant in question for variant in variants):
@@ -350,9 +368,18 @@ class QueryInterpreter:
 
     def _detect_metrics(self, compact_question: str) -> List[str]:
         matches: List[str] = []
+        occupied_spans: List[tuple[int, int]] = []
         for alias, metric_id in sorted(METRIC_ALIAS_TO_ID.items(), key=lambda item: len(item[0]), reverse=True):
-            if alias and alias in compact_question and metric_id not in matches:
-                matches.append(metric_id)
+            if not alias or metric_id in matches:
+                continue
+            start = compact_question.find(alias)
+            while start >= 0:
+                span = (start, start + len(alias))
+                if not any(start_idx <= span[0] and span[1] <= end_idx for start_idx, end_idx in occupied_spans):
+                    matches.append(metric_id)
+                    occupied_spans.append(span)
+                    break
+                start = compact_question.find(alias, start + 1)
         return matches
 
     def _detect_sections(self, compact_question: str) -> List[str]:

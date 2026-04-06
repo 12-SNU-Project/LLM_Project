@@ -179,6 +179,12 @@ class RetrievalFusionEngine:
             seen.add(key)
             deduped.append(row)
 
+        if interpretation.intent in {
+            QueryIntent.TABLE_CELL_LOOKUP,
+            QueryIntent.COMPARISON_LIST_LOOKUP,
+        }:
+            return deduped
+
         reverse = interpretation.intent != QueryIntent.TREND_COMPARE
         deduped.sort(
             key=lambda row: (

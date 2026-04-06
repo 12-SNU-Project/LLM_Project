@@ -329,6 +329,7 @@ class AuditReportPipeline:
         ]
 
         tables_registry_payload: List[Dict[str, object]] = []
+        table_rows_payload: List[Dict[str, object]] = []
         metric_facts_payload: List[Dict[str, object]] = []
 
         for table in result.tables:
@@ -343,6 +344,22 @@ class AuditReportPipeline:
                     "footnotes": table.footnotes,
                 }
             )
+            for row in table.rows:
+                table_rows_payload.append(
+                    {
+                        "row_id": row.row_id,
+                        "table_id": table.table_id,
+                        "filing_id": table.filing_id,
+                        "row_index": row.row_index,
+                        "raw_label": row.raw_label,
+                        "normalized_label": row.normalized_label,
+                        "row_depth": row.row_depth,
+                        "parent_row_id": row.parent_row_id,
+                        "is_section_header": row.is_section_header,
+                        "row_group_label": row.metadata.get("group_label"),
+                        "company_kind": row.metadata.get("company_kind"),
+                    }
+                )
             row_lookup = {row.row_id: row for row in table.rows}
 
             for value in table.values:
@@ -390,6 +407,7 @@ class AuditReportPipeline:
         return {
             "filings": filings,
             "tables_registry": tables_registry_payload,
+            "table_rows": table_rows_payload,
             "metric_facts": metric_facts_payload,
             "text_chunks": [
                 {

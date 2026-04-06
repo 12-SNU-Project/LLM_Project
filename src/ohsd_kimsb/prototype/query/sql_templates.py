@@ -33,6 +33,24 @@ FROM tables_registry t
 WHERE t.table_id IN ({placeholders})
 """
 
+TABLE_ROWS_BY_TABLE_IDS_SELECT = """
+SELECT
+    r.row_id,
+    r.table_id,
+    r.filing_id,
+    r.row_index,
+    r.raw_label,
+    r.normalized_label,
+    r.row_depth,
+    r.parent_row_id,
+    r.is_section_header,
+    r.row_group_label,
+    r.company_kind
+FROM table_rows r
+WHERE r.table_id IN ({placeholders})
+ORDER BY r.table_id, r.row_index
+"""
+
 
 class SQLTemplateEngine:
     # Runtime DB keeps one flat fact table, so metric lookups only need a few
@@ -166,6 +184,13 @@ JOIN filings f ON m.filing_id = f.filing_id
 
         deduped: List[Dict[str, Any]] = []
         seen = set()
+        row_context_map = self._fetch_table_row_contexts(
+            conn=conn,
+            table_ids=[str(context.get("table_id") or "") for context in filtered],
+            sql_rows=sql_rows,
+            interpretation=interpretation,
+            required_dimensions=required_dimensions,
+        )
         for context in filtered:
             key = (
                 context.get("table_id"),
@@ -182,6 +207,7 @@ JOIN filings f ON m.filing_id = f.filing_id
                     sql_rows=matched_rows,
                     interpretation=interpretation,
                     required_dimensions=required_dimensions,
+                    focused_rows=row_context_map.get(str(context.get("table_id") or ""), []),
                 )
             )
         deduped.sort(
@@ -201,6 +227,7 @@ JOIN filings f ON m.filing_id = f.filing_id
         sql_rows: List[Dict[str, Any]],
         interpretation: Optional[QueryInterpretation],
         required_dimensions: List[str],
+        focused_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         focused = dict(context)
         focus_row_labels = self._dedupe_strs(
@@ -218,6 +245,12 @@ JOIN filings f ON m.filing_id = f.filing_id
         )
         focused["focus_row_labels"] = focus_row_labels
         focused["focus_column_keys"] = focus_column_keys
+        focused["focused_rows"] = list(focused_rows or [])
+        focused["focus_row_ids"] = [
+            str(row.get("row_id") or "")
+            for row in focused["focused_rows"]
+            if str(row.get("row_id") or "")
+        ]
         focused["focused_table_markdown"] = self._build_focused_table_markdown(
             table_markdown=str(context.get("table_markdown") or ""),
             focus_row_labels=focus_row_labels,
@@ -232,6 +265,101 @@ JOIN filings f ON m.filing_id = f.filing_id
             required_dimensions=required_dimensions,
         )
         return focused
+
+    def _fetch_table_row_contexts(
+        self,
+        conn: sqlite3.Connection,
+        table_ids: List[str],
+        sql_rows: List[Dict[str, Any]],
+        interpretation: Optional[QueryInterpretation],
+        required_dimensions: List[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        table_ids = [table_id for table_id in self._dedupe_strs(table_ids) if table_id]
+        if not table_ids:
+            return {}
+
+        placeholders = self._placeholders(table_ids)
+        sql = TABLE_ROWS_BY_TABLE_IDS_SELECT.format(placeholders=placeholders)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute(sql, table_ids).fetchall()]
+        rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            rows_by_table.setdefault(str(row.get("table_id") or ""), []).append(row)
+
+        focus_row_labels = self._dedupe_strs(
+            [
+                *(row.get("raw_label") or row.get("normalized_label") or "" for row in sql_rows),
+                *((interpretation.row_label_terms + interpretation.row_label_filters) if interpretation else []),
+            ]
+        )
+        include_structure = "structure" in required_dimensions
+        return {
+            table_id: self._select_relevant_table_rows(
+                table_rows=table_rows,
+                focus_row_labels=focus_row_labels,
+                include_structure=include_structure,
+            )
+            for table_id, table_rows in rows_by_table.items()
+        }
+
+    @classmethod
+    def _select_relevant_table_rows(
+        cls,
+        table_rows: List[Dict[str, Any]],
+        focus_row_labels: List[str],
+        include_structure: bool,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        if not table_rows:
+            return []
+
+        by_row_id = {
+            str(row.get("row_id") or ""): row
+            for row in table_rows
+            if str(row.get("row_id") or "")
+        }
+        normalized_focus = [cls._normalize_lookup_text(label) for label in focus_row_labels if label]
+
+        selected_ids: List[str] = []
+        seen_ids = set()
+        for row in table_rows:
+            row_id = str(row.get("row_id") or "")
+            if not row_id:
+                continue
+            row_text = cls._normalize_lookup_text(
+                " ".join(
+                    part
+                    for part in (
+                        row.get("raw_label"),
+                        row.get("normalized_label"),
+                        row.get("row_group_label"),
+                    )
+                    if part
+                )
+            )
+            if any(label and label in row_text for label in normalized_focus):
+                current_id = row_id
+                while current_id:
+                    if current_id not in seen_ids and current_id in by_row_id:
+                        seen_ids.add(current_id)
+                        selected_ids.append(current_id)
+                    parent_id = str(by_row_id.get(current_id, {}).get("parent_row_id") or "")
+                    current_id = parent_id if parent_id and parent_id in by_row_id else ""
+
+        if include_structure or not selected_ids:
+            for row in table_rows:
+                row_id = str(row.get("row_id") or "")
+                if (
+                    row_id
+                    and row_id not in seen_ids
+                    and (bool(row.get("is_section_header")) or int(row.get("row_depth") or 0) <= 1)
+                ):
+                    seen_ids.add(row_id)
+                    selected_ids.append(row_id)
+
+        selected_rows = [by_row_id[row_id] for row_id in selected_ids if row_id in by_row_id]
+        selected_rows.sort(key=lambda row: int(row.get("row_index") or 0))
+        return selected_rows[: max(1, limit)]
 
     @staticmethod
     def _match_context_sql_rows(
@@ -420,6 +548,10 @@ JOIN filings f ON m.filing_id = f.filing_id
     def _compact_text(value: Any) -> str:
         return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(value or "")).lower()
 
+    @staticmethod
+    def _normalize_lookup_text(value: Any) -> str:
+        return re.sub(r"[\s_]+", "", str(value or "")).lower()
+
     def _build_metric_lookup(self, interpretation: QueryInterpretation) -> SQLQueryPlan:
         label_candidates = self._expand_label_candidates(interpretation.metric_candidates)
         column_candidates = self._expand_column_candidates(interpretation.metric_candidates)
@@ -573,6 +705,13 @@ WITH target_years AS (
             where_clauses.append(self._build_like_clause(self.TITLE_EXPR, interpretation.table_title_terms))
             params.extend([self._like_param(value) for value in interpretation.table_title_terms])
 
+        entity_scope_terms = {
+            term for term in interpretation.table_title_terms
+            if term in {"종속기업", "관계기업", "공동기업"}
+        }
+        if interpretation.row_label_filters and entity_scope_terms and not interpretation.column_terms:
+            where_clauses.append("COALESCE(m.semantic_table_type, '') = 'subsidiary_status_table'")
+
         if interpretation.period:
             # period는 전기/당기말처럼 열 헤더에도 있고, `(2) 전기` 같은 표 제목에도 숨어 있을 수 있다.
             where_clauses.append(
@@ -597,7 +736,9 @@ WITH target_years AS (
             + "\nWHERE "
             + "\n  AND ".join(where_clauses)
             + "\nORDER BY "
-            + self._table_cell_order_expr()
+            + self._table_cell_order_expr(interpretation)
+            + ", "
+            + self._table_cell_period_order_expr(interpretation)
             + ", f.fiscal_year DESC, m.page_start ASC, m.row_index ASC, m.col_index ASC\nLIMIT ?"
         )
         params.append(interpretation.limit)
@@ -777,7 +918,35 @@ WITH target_years AS (
         )
 
     @staticmethod
-    def _table_cell_order_expr() -> str:
+    def _table_cell_order_expr(interpretation: QueryInterpretation) -> str:
+        # Entity-specific note lookups should prefer the semantically closest
+        # note table before falling back to generic primary statements.
+        column_terms = [str(term or "") for term in interpretation.column_terms]
+        if any(("채권" in term) or ("채무" in term) for term in column_terms):
+            return (
+                "CASE COALESCE(m.semantic_table_type, '') "
+                "WHEN 'related_party_balance_table' THEN 0 "
+                "WHEN 'subsidiary_summary_financial_table' THEN 1 "
+                "WHEN 'subsidiary_status_table' THEN 2 "
+                "WHEN 'primary_financial_statement' THEN 3 "
+                "ELSE 9 END"
+            )
+        if any(("매출" in term) or ("매입" in term) for term in column_terms):
+            return (
+                "CASE COALESCE(m.semantic_table_type, '') "
+                "WHEN 'related_party_transaction_table' THEN 0 "
+                "WHEN 'subsidiary_summary_financial_table' THEN 1 "
+                "WHEN 'primary_financial_statement' THEN 2 "
+                "ELSE 9 END"
+            )
+        if any("지분" in term for term in column_terms) or interpretation.entity_scope:
+            return (
+                "CASE COALESCE(m.semantic_table_type, '') "
+                "WHEN 'subsidiary_status_table' THEN 0 "
+                "WHEN 'subsidiary_summary_financial_table' THEN 1 "
+                "WHEN 'primary_financial_statement' THEN 2 "
+                "ELSE 9 END"
+            )
         # 셀 단위 조회는 note table까지 포함되므로 의미 라벨과 period 일치도를 우선한다.
         return (
             "CASE COALESCE(m.semantic_table_type, '') "
@@ -788,6 +957,7 @@ WITH target_years AS (
             "WHEN 'subsidiary_summary_financial_table' THEN 3 "
             "WHEN 'related_party_transaction_table' THEN 4 "
             "WHEN 'related_party_balance_table' THEN 5 "
+            "WHEN 'subsidiary_status_table' THEN 6 "
             "ELSE 9 END"
         )
 
@@ -835,9 +1005,33 @@ WITH target_years AS (
             exact_table_rank,
             title_match_count,
             dimension_score,
+            SQLTemplateEngine._table_context_content_score(markdown),
             int(bool(markdown)),
             int(bool(footnotes)),
         )
+
+    @staticmethod
+    def _table_cell_period_order_expr(interpretation: QueryInterpretation) -> str:
+        if interpretation.period:
+            return "CASE WHEN 1=1 THEN 0 END"
+        return (
+            "CASE "
+            "WHEN COALESCE(m.period, '') IN ('당기', '당기말', '당기초') THEN 0 "
+            "WHEN COALESCE(m.table_title, '') LIKE '%당기%' THEN 0 "
+            "WHEN COALESCE(m.period, '') IN ('전기', '전기말', '전기초') THEN 1 "
+            "WHEN COALESCE(m.table_title, '') LIKE '%전기%' THEN 1 "
+            "ELSE 0 END"
+        )
+
+    @staticmethod
+    def _table_context_content_score(markdown: str) -> int:
+        table_lines = [line.strip() for line in markdown.splitlines() if line.strip().startswith("|")]
+        if len(table_lines) <= 2:
+            return 0
+        body_lines = table_lines[2:]
+        numeric_lines = sum(1 for line in body_lines if re.search(r"\d", line))
+        header_hint = int(any(token in markdown for token in ("| 과 목 |", "| 구 분 |", "| 회사명 |")))
+        return numeric_lines + header_hint
 
     @staticmethod
     def _dedupe_strs(values: List[Any]) -> List[str]:

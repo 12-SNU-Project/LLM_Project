@@ -115,7 +115,7 @@ class EvidenceExpansionPlanner:
             return bool(
                 interpretation.table_title_terms
                 or interpretation.row_label_terms
-                or interpretation.column_terms
+                or len(interpretation.column_terms) > 1
             )
         if interpretation.intent == QueryIntent.TEXT_EXPLANATION:
             return bool(

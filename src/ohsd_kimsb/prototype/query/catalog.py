@@ -70,19 +70,19 @@ METRIC_DEFINITIONS: Dict[str, MetricDefinition] = {
     ),
     "total_assets": _metric(
         "total_assets",
-        aliases=("자산총계", "총자산", "total assets"),
+        aliases=("자산총계", "총자산", "자산", "total assets"),
         row_label_aliases=("자산총계", "자산총액", "총자산"),
         statement_types=("statement_of_financial_position",),
     ),
     "total_liabilities": _metric(
         "total_liabilities",
-        aliases=("부채총계", "총부채", "total liabilities"),
+        aliases=("부채총계", "총부채", "부채", "total liabilities"),
         row_label_aliases=("부채총계", "총부채"),
         statement_types=("statement_of_financial_position",),
     ),
     "total_equity": _metric(
         "total_equity",
-        aliases=("자본총계", "총자본", "equity", "total equity"),
+        aliases=("자본총계", "총자본", "자본", "equity", "total equity"),
         row_label_aliases=("자본총계", "총자본"),
         statement_types=("statement_of_financial_position",),
     ),
