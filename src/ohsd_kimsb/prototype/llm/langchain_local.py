@@ -10,16 +10,23 @@ from typing import Any, Dict, List, Optional
 class LocalLLMConfig:
     provider: str = "ollama"
     model: str = "qwen3:8b"
-    base_url: str = "http://localhost:11434"
+    base_url: str = "http://127.0.0.1:11434"
     temperature: float = 0.0
     timeout: int = 120
+    num_gpu: Optional[int] = 1
+    num_thread: Optional[int] = None
+    keep_alive: Optional[int] = 300
 
 
 @dataclass
 class LocalEmbeddingConfig:
     provider: str = "ollama"
     model: str = "qwen3-embedding:8b"
-    base_url: str = "http://localhost:11434"
+    base_url: str = "http://127.0.0.1:11434"
+    timeout: int = 120
+    keep_alive: Optional[int] = 300
+    num_gpu: Optional[int] = 1
+    num_thread: Optional[int] = None
 
 
 class LangChainLocalLLM:
@@ -57,6 +64,9 @@ class LangChainLocalLLM:
             base_url=self.config.base_url,
             temperature=self.config.temperature,
             timeout=self.config.timeout,
+            num_gpu=self.config.num_gpu,
+            num_thread=self.config.num_thread,
+            keep_alive=self.config.keep_alive,
         )
 
     @staticmethod
@@ -98,6 +108,7 @@ class LangChainLocalLLM:
 class LangChainLocalEmbedding:
     def __init__(self, config: Optional[LocalEmbeddingConfig] = None) -> None:
         self.config = config or LocalEmbeddingConfig()
+        self._embedding_model: Optional[Any] = None
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         embedding_model = self._create_embedding_model()
@@ -109,15 +120,84 @@ class LangChainLocalEmbedding:
 
     def to_chroma_embedding_function(self) -> Any:
         # Chroma keeps the embedding boundary separate from the LLM path.
-        parent = self
+        config_payload = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "base_url": self.config.base_url,
+            "timeout": self.config.timeout,
+            "keep_alive": self.config.keep_alive,
+            "num_gpu": self.config.num_gpu,
+            "num_thread": self.config.num_thread,
+        }
+        function_name = self._chroma_function_name(config_payload)
 
         class _EmbeddingFunction:
+            def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+                self._config = dict(config or config_payload)
+                self._embedding = LangChainLocalEmbedding(LocalEmbeddingConfig(**self._config))
+
             def __call__(self, input: List[str]) -> List[List[float]]:
-                return parent.embed_documents(list(input))
+                return self._embedding.embed_documents(list(input))
+
+            def embed_query(self, input: Any) -> Any:
+                if isinstance(input, list):
+                    if not input:
+                        raise ValueError("query input is empty")
+                    return self._embedding.embed_documents([str(item) for item in input])
+                return self._embedding.embed_query(str(input))
+
+            @staticmethod
+            def name() -> str:
+                return function_name
+
+            @staticmethod
+            def build_from_config(config: Dict[str, Any]) -> "_EmbeddingFunction":
+                return _EmbeddingFunction(
+                    {
+                        "provider": str(config.get("provider") or config_payload["provider"]),
+                        "model": str(config.get("model") or config_payload["model"]),
+                        "base_url": str(config.get("base_url") or config_payload["base_url"]),
+                        "timeout": int(config.get("timeout") or config_payload["timeout"]),
+                        "keep_alive": (
+                            int(config["keep_alive"])
+                            if config.get("keep_alive") is not None
+                            else config_payload["keep_alive"]
+                        ),
+                        "num_gpu": (
+                            int(config["num_gpu"])
+                            if config.get("num_gpu") is not None
+                            else config_payload["num_gpu"]
+                        ),
+                        "num_thread": (
+                            int(config["num_thread"])
+                            if config.get("num_thread") is not None
+                            else config_payload["num_thread"]
+                        ),
+                    }
+                )
+
+            def get_config(self) -> Dict[str, Any]:
+                return dict(self._config)
+
+            @staticmethod
+            def default_space() -> str:
+                return "cosine"
+
+            @staticmethod
+            def supported_spaces() -> List[str]:
+                return ["cosine", "l2", "ip"]
 
         return _EmbeddingFunction()
 
+    @staticmethod
+    def _chroma_function_name(config: Dict[str, Any]) -> str:
+        raw_name = f"ohsd_{config['provider']}_{config['model']}"
+        sanitized = "".join(char if char.isalnum() else "_" for char in raw_name)
+        return sanitized.strip("_").lower()
+
     def _create_embedding_model(self) -> Any:
+        if self._embedding_model is not None:
+            return self._embedding_model
         if self.config.provider != "ollama":
             raise RuntimeError(f"Unsupported local embedding provider: {self.config.provider}")
         try:
@@ -127,10 +207,15 @@ class LangChainLocalEmbedding:
                 "langchain_ollama 패키지가 필요합니다. "
                 "임베딩 사용 전 langchain-core/langchain-ollama를 설치하십시오."
             ) from exc
-        return OllamaEmbeddings(
+        self._embedding_model = OllamaEmbeddings(
             model=self.config.model,
             base_url=self.config.base_url,
+            sync_client_kwargs={"timeout": float(self.config.timeout)},
+            keep_alive=self.config.keep_alive,
+            num_gpu=self.config.num_gpu,
+            num_thread=self.config.num_thread,
         )
+        return self._embedding_model
 
     @staticmethod
     def runtime_available() -> bool:

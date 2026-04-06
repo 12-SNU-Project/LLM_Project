@@ -10,6 +10,7 @@ class GeneratedAnswer:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     used_sql_rows: int = 0
     used_text_chunks: int = 0
+    used_table_contexts: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

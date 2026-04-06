@@ -18,6 +18,8 @@ class ChromaStoreConfig:
     collection_name: str = "audit_chunks"
     persist_directory: Optional[str] = None
     reset_collection: bool = False
+    upsert_batch_size: int = 32
+    log_ingest_progress: bool = False
 
 
 class ChromaVectorStore:
@@ -28,12 +30,16 @@ class ChromaVectorStore:
         persist_directory: Optional[str] = None,
         embedding_model: Optional[LangChainLocalEmbedding] = None,
         reset_collection: bool = False,
+        upsert_batch_size: int = 32,
+        log_ingest_progress: bool = False,
     ) -> None:
         self._collection = collection
         self.collection_name = collection_name
         self.persist_directory = persist_directory
         self.embedding_model = embedding_model
         self.reset_collection = reset_collection
+        self.upsert_batch_size = max(1, int(upsert_batch_size))
+        self.log_ingest_progress = log_ingest_progress
 
     @property
     def collection(self) -> Any:
@@ -41,15 +47,111 @@ class ChromaVectorStore:
             self._collection = self._create_default_collection()
         return self._collection
 
-    def upsert_documents(self, documents: Iterable[ChromaChunkDocument]) -> None:
+    def upsert_documents(self, documents: Iterable[ChromaChunkDocument]) -> Dict[str, int]:
         docs = list(documents)
         if not docs:
-            return
-        self.collection.upsert(
-            ids=[doc.document_id for doc in docs],
-            documents=[doc.text for doc in docs],
-            metadatas=[doc.to_chroma_record()["metadata"] for doc in docs],
-        )
+            return {
+                "documents_total": 0,
+                "batch_size": self.upsert_batch_size,
+                "batches_completed": 0,
+                "batches_total": 0,
+                "timeout_retries": 0,
+            }
+
+        total = len(docs)
+        batches_completed = 0
+        total_batches = (total + self.upsert_batch_size - 1) // self.upsert_batch_size
+        timeout_retries = 0
+        if self.log_ingest_progress:
+            print(
+                f"[chroma] starting upsert: total={total}, "
+                f"batch_size={self.upsert_batch_size}, batches={total_batches}",
+                flush=True,
+            )
+        for start in range(0, total, self.upsert_batch_size):
+            batch = docs[start:start + self.upsert_batch_size]
+            batch_index = batches_completed + 1
+            timeout_retries += self._upsert_batch(
+                batch=batch,
+                batch_index=batch_index,
+                total_batches=total_batches,
+            )
+            batches_completed += 1
+            if self.log_ingest_progress:
+                end = start + len(batch)
+                print(
+                    f"[chroma] upserted {end}/{total} documents "
+                    f"(batch {batches_completed}, size={len(batch)})",
+                    flush=True,
+                )
+
+        return {
+            "documents_total": total,
+            "batch_size": self.upsert_batch_size,
+            "batches_completed": batches_completed,
+            "batches_total": total_batches,
+            "timeout_retries": timeout_retries,
+        }
+
+    def _upsert_batch(
+        self,
+        *,
+        batch: List[ChromaChunkDocument],
+        batch_index: int,
+        total_batches: int,
+        retry_depth: int = 0,
+    ) -> int:
+        if self.log_ingest_progress:
+            retry_suffix = f", retry_depth={retry_depth}" if retry_depth else ""
+            print(
+                f"[chroma] starting batch {batch_index}/{total_batches} "
+                f"(size={len(batch)}{retry_suffix})",
+                flush=True,
+            )
+        try:
+            self.collection.upsert(
+                ids=[doc.document_id for doc in batch],
+                documents=[doc.text for doc in batch],
+                metadatas=[doc.to_chroma_record()["metadata"] for doc in batch],
+            )
+            return 0
+        except Exception as exc:
+            if not self._is_retryable_ingest_error(exc) or len(batch) <= 1:
+                raise
+            midpoint = len(batch) // 2
+            left = batch[:midpoint]
+            right = batch[midpoint:]
+            if self.log_ingest_progress:
+                print(
+                    f"[chroma] timeout on batch {batch_index}/{total_batches} "
+                    f"(size={len(batch)}); retrying as {len(left)} + {len(right)}",
+                    flush=True,
+                )
+            retries = 1
+            retries += self._upsert_batch(
+                batch=left,
+                batch_index=batch_index,
+                total_batches=total_batches,
+                retry_depth=retry_depth + 1,
+            )
+            retries += self._upsert_batch(
+                batch=right,
+                batch_index=batch_index,
+                total_batches=total_batches,
+                retry_depth=retry_depth + 1,
+            )
+            return retries
+
+    @staticmethod
+    def _is_retryable_ingest_error(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        class_names = {type(exc).__name__}
+        class_names.update(base.__name__ for base in type(exc).__mro__)
+        if any(name in {"ReadTimeout", "TimeoutException", "ConnectTimeout", "ConnectError"} for name in class_names):
+            return True
+        message = str(exc)
+        return "Failed to connect to Ollama" in message
 
     def query(self, query_text: str, top_k: int = 8, where: Optional[Dict[str, Any]] = None) -> List[VectorSearchHit]:
         result = self.collection.query(

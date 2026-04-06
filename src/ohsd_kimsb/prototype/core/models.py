@@ -120,6 +120,8 @@ class NormalizedTable:
     semantic_table_type: Optional[str] = None
     title: Optional[str] = None
     unit: Optional[str] = None
+    table_markdown: Optional[str] = None
+    footnotes: Optional[str] = None
     year_candidates: List[int] = field(default_factory=list)
     context_before: Optional[str] = None
     context_after: Optional[str] = None

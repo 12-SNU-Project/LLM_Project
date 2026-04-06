@@ -28,7 +28,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Prototype embedding/chroma runtime probe")
     parser.add_argument("--year", type=int, default=2024, help="적재할 특정 연도")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b", help="Chroma 임베딩 모델")
-    parser.add_argument("--ollama-base-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434", help="Ollama base URL")
     parser.add_argument("--chroma-dir", default=None, help="Chroma persist directory")
     parser.add_argument("--query", default="2024년 매출액과 관련 설명", help="샘플 검색 질의")
     args = parser.parse_args()

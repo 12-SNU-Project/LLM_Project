@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=6, help="vector retrieval top-k")
     parser.add_argument("--intent-model", default="qwen3-8b", help="질의 해석용 로컬 LLM")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b", help="Chroma 임베딩 모델")
-    parser.add_argument("--ollama-base-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434", help="Ollama base URL")
     parser.add_argument("--chroma-dir", default=None, help="Chroma persist directory")
     parser.add_argument("--force-inmemory", action="store_true", help="Chroma 대신 in-memory vector store 사용")
     parser.add_argument("--reset-chroma", action="store_true", help="Chroma collection 재생성")

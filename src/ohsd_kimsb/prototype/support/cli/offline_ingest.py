@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -21,7 +23,22 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _configure_runtime_noise() -> None:
+    # Apply noise suppression before importing Chroma/Ollama-related modules.
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+    os.environ.setdefault("GLOG_minloglevel", "2")
+    os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Unable to find acceptable character detection dependency.*",
+        category=Warning,
+        module=r"requests(\..*)?$",
+    )
+
+
 def main() -> None:
+    _configure_runtime_noise()
     repo_root, prototype_dir = _bootstrap_paths()
     workspace_pkg = prototype_dir.parent.name
     base_pkg = f"{workspace_pkg}.prototype"
@@ -43,7 +60,42 @@ def main() -> None:
     parser.add_argument("--manifest-path", default=str(defaults.manifest_path), help="ingest manifest JSON 경로")
     parser.add_argument("--collection-name", default="audit_chunks", help="Chroma collection 이름")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b", help="Chroma 임베딩 모델")
-    parser.add_argument("--ollama-base-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434", help="Ollama base URL")
+    parser.add_argument(
+        "--embedding-timeout",
+        type=int,
+        default=120,
+        help="개별 Ollama 임베딩 요청 timeout(초)",
+    )
+    parser.add_argument(
+        "--embedding-keep-alive",
+        type=int,
+        default=300,
+        help="Ollama 임베딩 모델 keep-alive(초), 0 이하면 비활성화",
+    )
+    parser.add_argument(
+        "--ollama-num-gpu",
+        type=int,
+        default=1,
+        help="Ollama GPU 사용 수. macOS에서는 1이 Metal GPU 사용, 0이 CPU 강제",
+    )
+    parser.add_argument(
+        "--ollama-num-thread",
+        type=int,
+        default=0,
+        help="Ollama CPU thread 수. 0이면 Ollama 자동 결정",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=32,
+        help="Chroma upsert 시 Ollama 임베딩 요청 배치 크기",
+    )
+    parser.add_argument(
+        "--quiet-ingest-progress",
+        action="store_true",
+        help="Chroma 배치 적재 진행 로그를 출력하지 않음",
+    )
     parser.add_argument("--reset-db", action="store_true", help="기존 SQLite DB를 삭제 후 재생성")
     parser.add_argument("--reset-chroma", action="store_true", help="기존 Chroma collection을 삭제 후 재생성")
     parser.add_argument("--strict-runtime", action="store_true", help="Chroma/임베딩 실패 시 fallback 없이 종료")
@@ -112,6 +164,12 @@ def main() -> None:
             prefer_chroma=True,
             allow_fallback=not args.strict_runtime,
             reset_chroma_collection=args.reset_chroma,
+            embedding_upsert_batch_size=max(1, args.embedding_batch_size),
+            log_vector_ingest_progress=not args.quiet_ingest_progress,
+            embedding_timeout=max(1, args.embedding_timeout),
+            embedding_keep_alive=(args.embedding_keep_alive if args.embedding_keep_alive > 0 else None),
+            ollama_num_gpu=(args.ollama_num_gpu if args.ollama_num_gpu >= 0 else None),
+            ollama_num_thread=(args.ollama_num_thread if args.ollama_num_thread > 0 else None),
         )
     ).build(parse_results=parse_results, repo_root=repo_root)
 
@@ -124,6 +182,11 @@ def main() -> None:
         "chroma_dir": str(chroma_dir),
         "collection_name": args.collection_name,
         "embedding_model": args.embedding_model,
+        "embedding_batch_size": max(1, args.embedding_batch_size),
+        "embedding_timeout": max(1, args.embedding_timeout),
+        "embedding_keep_alive": (args.embedding_keep_alive if args.embedding_keep_alive > 0 else None),
+        "ollama_num_gpu": (args.ollama_num_gpu if args.ollama_num_gpu >= 0 else None),
+        "ollama_num_thread": (args.ollama_num_thread if args.ollama_num_thread > 0 else None),
         "ollama_base_url": args.ollama_base_url,
         "runtime_report": runtime.runtime_report,
         "parse_summary": parse_summary,

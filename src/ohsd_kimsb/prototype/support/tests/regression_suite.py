@@ -38,6 +38,9 @@ def run() -> Dict[str, Any]:
     runtime_module = importlib.import_module(f"{base_pkg}.service.runtime_factory")
     PrototypeRuntimeConfig = runtime_module.PrototypeRuntimeConfig
     PrototypeRuntimeFactory = runtime_module.PrototypeRuntimeFactory
+    LangChainLocalEmbedding = importlib.import_module(f"{base_pkg}.llm.langchain_local").LangChainLocalEmbedding
+    ChromaVectorStore = importlib.import_module(f"{base_pkg}.retrieval.chroma_store").ChromaVectorStore
+    ChromaChunkDocument = importlib.import_module(f"{base_pkg}.retrieval.schema").ChromaChunkDocument
 
     data_files = sorted((repo_root / "data").glob("*.htm"))
     pipeline = AuditReportPipeline()
@@ -63,6 +66,16 @@ def run() -> Dict[str, Any]:
         _check(all(block.page_index is not None for block in result.blocks), f"{path.name}: block page_index missing", failures)
         _check(all(table.section_id for table in result.tables), f"{path.name}: table section linkage missing", failures)
         _check(all(table.page_start is not None for table in result.tables), f"{path.name}: table page_start missing", failures)
+        _check(
+            all((table.table_markdown or "").startswith("**[표 단위:") for table in result.tables),
+            f"{path.name}: table markdown/unit header missing",
+            failures,
+        )
+        _check(
+            any(table.unit for table in result.tables),
+            f"{path.name}: table unit extraction missing",
+            failures,
+        )
         _check(all(chunk.page_start is not None for chunk in result.text_chunks), f"{path.name}: chunk page_start missing", failures)
         _check(max_chunk <= 1200, f"{path.name}: chunk length exceeded max_chars ({max_chunk})", failures)
         _check(section_counts.get("audit_opinion", 0) == 1, f"{path.name}: audit_opinion count != 1", failures)
@@ -118,6 +131,15 @@ def run() -> Dict[str, Any]:
     for result in parse_results:
         loader.load_payload(pipeline.to_rdb_payload(result))
 
+    with sqlite3.connect(db_path) as conn:
+        filings_columns = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+        text_chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(text_chunks)").fetchall()}
+    _check("source_file" not in filings_columns, "schema: filings.source_file should be removed", failures)
+    _check("source_encoding" not in filings_columns, "schema: filings.source_encoding should be removed", failures)
+    _check("parser_backend" not in filings_columns, "schema: filings.parser_backend should be removed", failures)
+    _check("report_type" not in filings_columns, "schema: filings.report_type should be removed", failures)
+    _check("source_file" not in text_chunk_columns, "schema: text_chunks.source_file should be removed", failures)
+
     runtime = PrototypeRuntimeFactory(
         PrototypeRuntimeConfig(
             intent_model="qwen3:8b",
@@ -132,7 +154,178 @@ def run() -> Dict[str, Any]:
     _check(runtime.runtime_report.get("preferred_intent_model") == "qwen3:8b", "runtime: intent model default mismatch", failures)
     _check(runtime.runtime_report.get("preferred_answer_model") == "qwen3:8b", "runtime: answer model default mismatch", failures)
     _check(runtime.runtime_report.get("preferred_embedding_model") == "qwen3-embedding:8b", "runtime: embedding model default mismatch", failures)
+    _check(runtime.runtime_report.get("embedding_upsert_batch_size") == 32, "runtime: embedding batch size default mismatch", failures)
+    _check(runtime.runtime_report.get("embedding_timeout") == 120, "runtime: embedding timeout default mismatch", failures)
+    _check(runtime.runtime_report.get("embedding_keep_alive") == 300, "runtime: embedding keep_alive default mismatch", failures)
+    _check(runtime.runtime_report.get("ollama_num_gpu") == 1, "runtime: ollama num_gpu default mismatch", failures)
     _check(runtime.runtime_report.get("vector_backend") in {"chroma", "in_memory"}, "runtime: vector backend missing", failures)
+    chroma_embedding_function = LangChainLocalEmbedding().to_chroma_embedding_function()
+    _check(callable(getattr(chroma_embedding_function, "name", None)), "runtime: chroma embedding function name missing", failures)
+    _check(
+        str(chroma_embedding_function.name()).startswith("ohsd_"),
+        "runtime: chroma embedding function name mismatch",
+        failures,
+    )
+    chroma_embedding_config = chroma_embedding_function.get_config()
+    _check(
+        chroma_embedding_config.get("provider") == "ollama",
+        "runtime: chroma embedding function provider mismatch",
+        failures,
+    )
+    _check(
+        chroma_embedding_config.get("timeout") == 120,
+        "runtime: chroma embedding function timeout mismatch",
+        failures,
+    )
+    rebuilt_embedding_function = chroma_embedding_function.build_from_config(chroma_embedding_config)
+    _check(
+        callable(getattr(rebuilt_embedding_function, "__call__", None)),
+        "runtime: chroma embedding function rebuild failed",
+        failures,
+    )
+    _check(
+        callable(getattr(chroma_embedding_function, "embed_query", None)),
+        "runtime: chroma embedding function embed_query missing",
+        failures,
+    )
+    chroma_embedding_function._embedding.embed_query = lambda text: [0.1, 0.2, 0.3]
+    chroma_embedding_function._embedding.embed_documents = lambda texts: [
+        [float(index), float(index) + 0.5]
+        for index, _ in enumerate(texts, start=1)
+    ]
+    _check(
+        chroma_embedding_function.embed_query("sample") == [0.1, 0.2, 0.3],
+        "runtime: chroma embedding function scalar query shape mismatch",
+        failures,
+    )
+    _check(
+        chroma_embedding_function.embed_query(["sample", "query"]) == [[1.0, 1.5], [2.0, 2.5]],
+        "runtime: chroma embedding function batched query shape mismatch",
+        failures,
+    )
+    if runtime.runtime_report.get("vector_backend") == "chroma":
+        vector_ingest_stats = runtime.runtime_report.get("vector_ingest_stats") or {}
+        _check(
+            vector_ingest_stats.get("documents_total") == runtime.runtime_report.get("vector_document_count"),
+            "runtime: vector ingest document count mismatch",
+            failures,
+        )
+        _check(
+            vector_ingest_stats.get("batch_size") == runtime.runtime_report.get("embedding_upsert_batch_size"),
+            "runtime: vector ingest batch size mismatch",
+            failures,
+        )
+        _check(
+            vector_ingest_stats.get("batches_total", 0) >= 1,
+            "runtime: vector ingest batch total missing",
+            failures,
+        )
+
+    class _FakeCollection:
+        def __init__(self) -> None:
+            self.calls: List[Dict[str, Any]] = []
+
+        def upsert(self, *, ids: List[str], documents: List[str], metadatas: List[Dict[str, Any]]) -> None:
+            self.calls.append(
+                {
+                    "ids": list(ids),
+                    "documents": list(documents),
+                    "metadatas": list(metadatas),
+                }
+            )
+
+    fake_collection = _FakeCollection()
+    batch_store = ChromaVectorStore(
+        collection=fake_collection,
+        upsert_batch_size=2,
+        log_ingest_progress=False,
+    )
+    batch_docs = [
+        ChromaChunkDocument(
+            document_id=f"doc-{index}",
+            text=f"sample text {index}",
+            metadata={"page_start": index},
+        )
+        for index in range(5)
+    ]
+    batch_stats = batch_store.upsert_documents(batch_docs)
+    _check(len(fake_collection.calls) == 3, "runtime: chroma batch upsert call count mismatch", failures)
+    _check(
+        [len(call["ids"]) for call in fake_collection.calls] == [2, 2, 1],
+        "runtime: chroma batch upsert sizes mismatch",
+        failures,
+    )
+    _check(batch_stats.get("documents_total") == 5, "runtime: chroma batch upsert document total mismatch", failures)
+    _check(batch_stats.get("batch_size") == 2, "runtime: chroma batch upsert stats batch size mismatch", failures)
+    _check(
+        batch_stats.get("batches_completed") == 3,
+        "runtime: chroma batch upsert completed batch count mismatch",
+        failures,
+    )
+    _check(batch_stats.get("batches_total") == 3, "runtime: chroma batch upsert total batch count mismatch", failures)
+    _check(batch_stats.get("timeout_retries") == 0, "runtime: chroma batch upsert unexpected timeout retries", failures)
+
+    class _TimeoutThenSplitCollection:
+        def __init__(self) -> None:
+            self.calls: List[int] = []
+
+        def upsert(self, *, ids: List[str], documents: List[str], metadatas: List[Dict[str, Any]]) -> None:
+            self.calls.append(len(ids))
+            if len(ids) > 2:
+                raise TimeoutError("simulated timeout")
+
+    timeout_collection = _TimeoutThenSplitCollection()
+    timeout_store = ChromaVectorStore(
+        collection=timeout_collection,
+        upsert_batch_size=4,
+        log_ingest_progress=False,
+    )
+    timeout_docs = [
+        ChromaChunkDocument(
+            document_id=f"timeout-doc-{index}",
+            text=f"timeout text {index}",
+            metadata={"page_start": index},
+        )
+        for index in range(4)
+    ]
+    timeout_stats = timeout_store.upsert_documents(timeout_docs)
+    _check(
+        timeout_collection.calls == [4, 2, 2],
+        "runtime: chroma timeout split retry pattern mismatch",
+        failures,
+    )
+    _check(
+        timeout_stats.get("timeout_retries") == 1,
+        "runtime: chroma timeout retry count mismatch",
+        failures,
+    )
+
+    class _ConnectionThenSplitCollection:
+        def __init__(self) -> None:
+            self.calls: List[int] = []
+
+        def upsert(self, *, ids: List[str], documents: List[str], metadatas: List[Dict[str, Any]]) -> None:
+            self.calls.append(len(ids))
+            if len(ids) > 2:
+                raise ConnectionError("Failed to connect to Ollama.")
+
+    connection_collection = _ConnectionThenSplitCollection()
+    connection_store = ChromaVectorStore(
+        collection=connection_collection,
+        upsert_batch_size=4,
+        log_ingest_progress=False,
+    )
+    connection_stats = connection_store.upsert_documents(timeout_docs)
+    _check(
+        connection_collection.calls == [4, 2, 2],
+        "runtime: chroma connection split retry pattern mismatch",
+        failures,
+    )
+    _check(
+        connection_stats.get("timeout_retries") == 1,
+        "runtime: chroma connection retry count mismatch",
+        failures,
+    )
 
     drift_question = "2023년도 매출액과 2022년도 매출액을 비교해줘."
     drift_interpretation = QueryInterpreter().interpret(
@@ -194,6 +387,24 @@ def run() -> Dict[str, Any]:
             "clarification_needed": False,
         },
         {
+            "question": "2024년 보고기간 후 사건이 뭐야?",
+            "expected_intent": "text_explanation",
+            "expect_sql": False,
+            "expect_vdb": True,
+            "clarification_needed": False,
+            "expect_vector_section_type": "subsequent_events",
+            "expect_vector_text_fragment": "보고기간 후 사건",
+        },
+        {
+            "question": "2024년 우발부채와 약정사항을 요약해줘.",
+            "expected_intent": "text_explanation",
+            "expect_sql": False,
+            "expect_vdb": True,
+            "clarification_needed": False,
+            "expect_vector_section_type": "contingent_liabilities_and_commitments",
+            "expect_vector_text_fragment": "우발부채와 약정사항",
+        },
+        {
             "question": "2024년 매출액과 관련 설명을 알려줘",
             "expected_intent": "metric_with_explanation",
             "expect_sql": True,
@@ -239,6 +450,28 @@ def run() -> Dict[str, Any]:
             "expect_value_raw": "72.75%",
         },
         {
+            "question": "2020년 영업이익이 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "영 업 이 익",
+            "expect_semantic_table_type": "primary_financial_statement",
+            "expect_value_raw": "20,518,974",
+            "expect_period": "당기",
+        },
+        {
+            "question": "2022년 총자산이 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "자 산 총 계",
+            "expect_semantic_table_type": "primary_financial_statement",
+            "expect_value_raw": "260,083,750",
+            "expect_period": "당기",
+        },
+        {
             "question": "재무적으로 위험한가?",
             "expected_intent": "metric_lookup",
             "expect_sql": False,
@@ -263,6 +496,40 @@ def run() -> Dict[str, Any]:
             "expect_semantic_table_type": "related_party_transaction_table",
         },
         {
+            "question": "2024년 Samsung Electronics (UK) Ltd의 채권은 얼마야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Electronics (UK) Ltd",
+            "expect_column_key_fragment": "채권",
+            "expect_semantic_table_type": "related_party_balance_table",
+            "expect_value_raw": "93,808",
+        },
+        {
+            "question": "2024년 Samsung Electronics (UK) Ltd는 종속기업이야 관계기업이야?",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Electronics (UK) Ltd",
+            "expect_semantic_table_type": "subsidiary_status_table",
+            "expect_company_kind": "subsidiary",
+            "expect_answer_fragment": "종속기업",
+        },
+        {
+            "question": "2019년 주요 종속기업 요약 재무정보에서 Samsung Semiconductor, Inc.(SSI)의 매출액은 얼마야?",
+            "expected_intent": "metric_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_row_label_fragment": "Samsung Semiconductor, Inc.(SSI)",
+            "expect_column_key_fragment": "매출액",
+            "expect_semantic_table_type": "subsidiary_summary_financial_table",
+            "expect_value_raw": "16,473,214",
+            "expect_table_title_fragment": "요약 재무정보",
+        },
+        {
             "question": "2014년 전기의 개발비 기초장부가액이 얼마야?",
             "expected_intent": "table_cell_lookup",
             "expect_sql": True,
@@ -273,6 +540,9 @@ def run() -> Dict[str, Any]:
             "expect_semantic_table_type": "intangible_asset_rollforward_table",
             "expect_value_raw": "602,274",
             "expect_table_title_fragment": "전기",
+            "expect_table_context_min": 1,
+            "expect_focused_markdown_contains": ["| 구 분 | 개발비 |", "| 기초장부가액 | 602,274 |"],
+            "expect_focused_markdown_not_contains": ["산업재산권", "회원권", "영업권"],
         },
         {
             "question": "2014년 보험수리적 가정에 대해 알려줘(당기말의 할인율) 표를 참고해서 정확한 수치를 알려줘.",
@@ -305,6 +575,26 @@ def run() -> Dict[str, Any]:
             "expect_column_key_fragment": "토지",
             "expect_semantic_table_type": "property_plant_equipment_rollforward_table",
             "expect_table_title_fragment": "유형자산",
+            "expect_table_context_min": 1,
+            "expect_table_context_unit_header": True,
+            "expect_evidence_requirement": "structure",
+            "expect_evidence_gap_resolved": "structure",
+            "expect_focused_markdown_contains": ["토지", "건물및구축물", "기계장치"],
+            "expect_focused_markdown_not_contains": ["열1"],
+        },
+        {
+            "question": "2014년 종속기업 및 관계기업 투자 변동내역 표의 (*1) 각주 설명을 알려줘.",
+            "expected_intent": "table_cell_lookup",
+            "expect_sql": True,
+            "expect_vdb": False,
+            "clarification_needed": False,
+            "expect_semantic_table_type": "note_general_numeric_table",
+            "expect_table_context_min": 1,
+            "expect_evidence_requirement": "footnote",
+            "expect_evidence_gap_resolved": "footnote",
+            "expect_focused_markdown_contains": ["손상(*1)", "| 구 분 | 당기 | 전기 |"],
+            "expect_focused_footnotes_contains": ["(*1)", "손상차손"],
+            "expect_focused_footnotes_not_contains": ["(*2)"],
         },
         {
             "question": "2024년 지분율이 70% 미만인 종속기업들을 리스트업해",
@@ -359,6 +649,22 @@ def run() -> Dict[str, Any]:
                 )
             else:
                 _check(not bundle["vector_hits"], f"query `{case['question']}`: vector_hits should be empty", failures)
+
+            expected_vector_section_type = case.get("expect_vector_section_type")
+            if expected_vector_section_type:
+                _check(
+                    bool(bundle["vector_hits"]) and bundle["vector_hits"][0]["metadata"].get("section_type") == expected_vector_section_type,
+                    f"query `{case['question']}`: top vector section_type mismatch",
+                    failures,
+                )
+
+            expected_vector_text_fragment = case.get("expect_vector_text_fragment")
+            if expected_vector_text_fragment:
+                _check(
+                    bool(bundle["vector_hits"]) and expected_vector_text_fragment in bundle["vector_hits"][0].get("text", ""),
+                    f"query `{case['question']}`: top vector text fragment missing",
+                    failures,
+                )
 
             if interpretation["intent"] == "trend_compare" and not interpretation["clarification_needed"]:
                 years = {row.get("fiscal_year") for row in bundle["sql_results"] if row.get("fiscal_year") is not None}
@@ -417,6 +723,14 @@ def run() -> Dict[str, Any]:
                     failures,
                 )
 
+            expected_company_kind = case.get("expect_company_kind")
+            if expected_company_kind:
+                _check(
+                    any((row.get("company_kind") or "") == expected_company_kind for row in bundle["sql_results"]),
+                    f"query `{case['question']}`: expected company_kind missing",
+                    failures,
+                )
+
             expected_value_raw = case.get("expect_value_raw")
             if expected_value_raw:
                 _check(
@@ -463,6 +777,98 @@ def run() -> Dict[str, Any]:
                     failures,
                 )
 
+            expected_answer_fragment = case.get("expect_answer_fragment")
+            if expected_answer_fragment:
+                _check(
+                    expected_answer_fragment in (answer.get("answer_text") or ""),
+                    f"query `{case['question']}`: expected answer fragment missing",
+                    failures,
+                )
+
+            expected_table_context_min = case.get("expect_table_context_min")
+            if expected_table_context_min is not None:
+                _check(
+                    len(bundle.get("table_contexts", [])) >= expected_table_context_min,
+                    f"query `{case['question']}`: table_contexts fewer than expected minimum",
+                    failures,
+                )
+
+            if case.get("expect_table_context_unit_header"):
+                _check(
+                    any(
+                        (context.get("table_markdown") or "").startswith("**[표 단위:")
+                        for context in bundle.get("table_contexts", [])
+                    ),
+                    f"query `{case['question']}`: table context markdown unit header missing",
+                    failures,
+                )
+
+            expected_focused_markdown_contains = case.get("expect_focused_markdown_contains")
+            if expected_focused_markdown_contains:
+                focused_markdowns = [
+                    str(context.get("focused_table_markdown") or "")
+                    for context in bundle.get("table_contexts", [])
+                ]
+                for expected_fragment in expected_focused_markdown_contains:
+                    _check(
+                        any(expected_fragment in markdown for markdown in focused_markdowns),
+                        f"query `{case['question']}`: focused markdown fragment `{expected_fragment}` missing",
+                        failures,
+                    )
+
+            expected_focused_markdown_not_contains = case.get("expect_focused_markdown_not_contains")
+            if expected_focused_markdown_not_contains:
+                for forbidden_fragment in expected_focused_markdown_not_contains:
+                    _check(
+                        all(
+                            forbidden_fragment not in str(context.get("focused_table_markdown") or "")
+                            for context in bundle.get("table_contexts", [])
+                        ),
+                        f"query `{case['question']}`: forbidden focused markdown fragment `{forbidden_fragment}` present",
+                        failures,
+                    )
+
+            expected_focused_footnotes_contains = case.get("expect_focused_footnotes_contains")
+            if expected_focused_footnotes_contains:
+                focused_footnotes = [
+                    str(context.get("focused_footnotes") or "")
+                    for context in bundle.get("table_contexts", [])
+                ]
+                for expected_fragment in expected_focused_footnotes_contains:
+                    _check(
+                        any(expected_fragment in footnote for footnote in focused_footnotes),
+                        f"query `{case['question']}`: focused footnote fragment `{expected_fragment}` missing",
+                        failures,
+                    )
+
+            expected_focused_footnotes_not_contains = case.get("expect_focused_footnotes_not_contains")
+            if expected_focused_footnotes_not_contains:
+                for forbidden_fragment in expected_focused_footnotes_not_contains:
+                    _check(
+                        all(
+                            forbidden_fragment not in str(context.get("focused_footnotes") or "")
+                            for context in bundle.get("table_contexts", [])
+                        ),
+                        f"query `{case['question']}`: forbidden focused footnote fragment `{forbidden_fragment}` present",
+                        failures,
+                    )
+
+            expected_evidence_requirement = case.get("expect_evidence_requirement")
+            if expected_evidence_requirement:
+                _check(
+                    expected_evidence_requirement in bundle.get("evidence_requirements", []),
+                    f"query `{case['question']}`: expected evidence requirement missing",
+                    failures,
+                )
+
+            expected_resolved_gap = case.get("expect_evidence_gap_resolved")
+            if expected_resolved_gap:
+                _check(
+                    expected_resolved_gap not in bundle.get("evidence_gaps", []),
+                    f"query `{case['question']}`: expected evidence gap not resolved",
+                    failures,
+                )
+
             query_summary.append(
                 {
                     "question": case["question"],
@@ -470,6 +876,9 @@ def run() -> Dict[str, Any]:
                     "clarification_needed": interpretation["clarification_needed"],
                     "sql_rows": len(bundle["sql_results"]),
                     "vector_hits": len(bundle["vector_hits"]),
+                    "table_contexts": len(bundle.get("table_contexts", [])),
+                    "evidence_requirements": bundle.get("evidence_requirements", []),
+                    "evidence_gaps": bundle.get("evidence_gaps", []),
                     "citations": len(bundle["citations"]),
                     "retrieval_summary": bundle.get("retrieval_summary", {}),
                 }

@@ -56,6 +56,12 @@ class EvidenceOrganizer:
             seen.add(key)
             deduped.append(row)
 
+        if interpretation.intent in {
+            QueryIntent.TABLE_CELL_LOOKUP,
+            QueryIntent.COMPARISON_LIST_LOOKUP,
+        }:
+            return deduped[: self.max_sql_rows]
+
         reverse = interpretation.intent != QueryIntent.TREND_COMPARE
         deduped.sort(key=lambda row: self._sql_sort_key(row, interpretation), reverse=reverse)
         max_sql_rows = self.max_sql_rows
