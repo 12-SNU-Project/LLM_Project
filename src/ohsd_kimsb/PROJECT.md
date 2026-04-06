@@ -39,7 +39,7 @@
 - `chromadb`가 설치되어 있어도 구버전 `chromadb`와 `pydantic v2` 조합이면 import 단계에서 실패할 수 있다.
 - 이 경우 `pydantic-settings`만 추가로 설치해도 해결되지 않을 수 있으며, `chromadb`와 `pydantic` 버전을 함께 맞춰야 한다.
 - 최신 `chromadb`는 custom embedding function에 `name`, `build_from_config`, `get_config` 같은 직렬화 메서드를 요구하므로, runtime adapter도 이 계약을 만족해야 한다.
-- 최신 `chromadb` query 경로는 custom embedding function에 `embed_query`도 기대하므로, ingest만 성공해도 query adapter가 빠져 있으면 설명형 질의가 런타임에서 실패할 수 있다.
+- 최신 `chromadb` query 경로는 custom embedding function에 `embed_query`도 기대하며, batched query에서는 `List[List[float]]` 형상을 요구한다. ingest만 성공하고 query shape가 틀리면 `service_cli`에서 런타임 예외가 날 수 있다.
 - CLI 진입점은 `requests` 인코딩 경고와 gRPC/absl 초기 노이즈 로그를 기본적으로 억제한다. 실제 실패 원인은 traceback과 manifest runtime report 기준으로 본다.
 - `offline_ingest.py`의 Chroma 적재는 기본적으로 배치 단위로 upsert한다. 기본 배치 크기는 `32`이며, `--embedding-batch-size`로 조절할 수 있다.
 - 임베딩 경로는 `OllamaEmbeddings` client를 재사용하고, 기본 timeout은 `120초`, 기본 keep-alive는 `300초`다. `--embedding-timeout`, `--embedding-keep-alive`로 조절할 수 있다.
@@ -59,6 +59,8 @@
 7. 최종 답변 생성
 
 중요한 점은 온라인 서비스에서는 HTML을 다시 파싱하지 않는다는 것이다.
+또한 `service_cli.py`는 ingest manifest를 읽어 DB/Chroma 경로뿐 아니라 임베딩 모델, Ollama base URL,
+embedding timeout/keep-alive, GPU 설정도 가능한 한 같은 값으로 복원한다.
 
 ## 현재 런타임 산출물
 현재 runtime DB는 추론에 필요한 최소 구조만 남긴다.

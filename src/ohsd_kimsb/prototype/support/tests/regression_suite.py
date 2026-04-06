@@ -188,6 +188,21 @@ def run() -> Dict[str, Any]:
         "runtime: chroma embedding function embed_query missing",
         failures,
     )
+    chroma_embedding_function._embedding.embed_query = lambda text: [0.1, 0.2, 0.3]
+    chroma_embedding_function._embedding.embed_documents = lambda texts: [
+        [float(index), float(index) + 0.5]
+        for index, _ in enumerate(texts, start=1)
+    ]
+    _check(
+        chroma_embedding_function.embed_query("sample") == [0.1, 0.2, 0.3],
+        "runtime: chroma embedding function scalar query shape mismatch",
+        failures,
+    )
+    _check(
+        chroma_embedding_function.embed_query(["sample", "query"]) == [[1.0, 1.5], [2.0, 2.5]],
+        "runtime: chroma embedding function batched query shape mismatch",
+        failures,
+    )
     if runtime.runtime_report.get("vector_backend") == "chroma":
         vector_ingest_stats = runtime.runtime_report.get("vector_ingest_stats") or {}
         _check(

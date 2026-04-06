@@ -139,11 +139,11 @@ class LangChainLocalEmbedding:
             def __call__(self, input: List[str]) -> List[List[float]]:
                 return self._embedding.embed_documents(list(input))
 
-            def embed_query(self, input: Any) -> List[float]:
+            def embed_query(self, input: Any) -> Any:
                 if isinstance(input, list):
                     if not input:
                         raise ValueError("query input is empty")
-                    input = input[0]
+                    return self._embedding.embed_documents([str(item) for item in input])
                 return self._embedding.embed_query(str(input))
 
             @staticmethod
