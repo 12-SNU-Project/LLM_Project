@@ -24,7 +24,7 @@ from collections import defaultdict
 
 
 # 프로젝트 기준 경로/모델 상수
-BASE        = "/Users/parkhyeonseo/Documents/SNU12_ABS_Code/프로젝트/자연어처리"
+BASE        = "LLM_Project/data"
 VECTOR_PATH = f"{BASE}/chroma_db"
 SQLITE_PATH = f"{BASE}/audit_data.db"
 OLLAMA_URL  = "http://localhost:11434"

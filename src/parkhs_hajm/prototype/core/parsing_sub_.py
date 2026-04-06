@@ -27,7 +27,7 @@ from typing import List, Dict, Optional, Tuple
 import sqlite3, re, os, shutil, json, hashlib
 
 
-BASE = "/Users/parkhyeonseo/Documents/SNU12_ABS_Code/프로젝트/자연어처리"
+BASE = "LLM_Project/data"
 
 
 # ============================================================
