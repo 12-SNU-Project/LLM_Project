@@ -19,11 +19,14 @@ HTML 파싱과 기본적인 데이터 파이프라인 구성을 토대로, CI/CD
 ### 
 ### 사용 언어
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![SQL](https://img.shields.io/badge/SQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 ### 패키지
-![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
 ![BeautifulSoup](https://img.shields.io/badge/BeautifulSoup-44A833?style=for-the-badge&logo=html5&logoColor=white)
+![Hugging Face](https://img.shields.io/badge/Hugging%20Face-8A2BE2?style=for-the-badge&logo=huggingface&logoColor=white)
+![LangChain](https://img.shields.io/badge/%20LangChain-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white)
 ### Tools
 ![Conda](https://img.shields.io/badge/Anaconda-44A833?style=for-the-badge&logo=anaconda&logoColor=white)
+![ChromaDB](https://img.shields.io/badge/ChromaDB-004A7C?style=for-the-badge&logo=google-cloud&logoColor=white) 
 ![Ollama](https://img.shields.io/badge/ollama-000000?style=for-the-badge&logo=ollama&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ---
@@ -34,6 +37,7 @@ HTML 파싱과 기본적인 데이터 파이프라인 구성을 토대로, CI/CD
 │
 ├── 📂 src/                       # 소스코드
 │   ├── 📂 ohsd_kimsb/   
+│   ├── 📂 kimsb/   
 │   ├── 📂 leemh_ohjy/
 │   └── 📂 parkhs_hajm/
 ├── 📂 data/                      # 감사 보고서 문서
@@ -52,7 +56,7 @@ HTML 파싱과 기본적인 데이터 파이프라인 구성을 토대로, CI/CD
 | 박현서 | 개발 | [@hyeonseo021003-ops](https://github.com/hyeonseo021003-ops) |
 | 이민환 | 개발 | [@q277wsvtzt](https://github.com/q277wsvtzt) |
 | 오주영 | 개발 | [@dhwn1323-a11y](https://github.com/dhwn1323-a11y) |
-| 김수비 | 개발 |  |
+| 김수비 | 개발 | [@ksubi0403](https://github.com/ksubi0403) |
 ---
 
 
