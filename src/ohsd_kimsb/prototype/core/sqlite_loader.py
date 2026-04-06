@@ -15,6 +15,7 @@ class SQLiteLoader:
 
     TABLE_ORDER = [
         "filings",
+        "tables_registry",
         "metric_facts",
         "text_chunks",
     ]

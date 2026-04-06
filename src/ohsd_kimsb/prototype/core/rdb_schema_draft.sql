@@ -2,21 +2,27 @@ CREATE TABLE IF NOT EXISTS filings (
     filing_id                VARCHAR(128) PRIMARY KEY,
     company_name             VARCHAR(200) NOT NULL,
     fiscal_year              INTEGER,
-    report_type              VARCHAR(100) NOT NULL DEFAULT '감사보고서',
     auditor_name             VARCHAR(200),
-    auditor_report_date      VARCHAR(40),
-    source_file              TEXT,
-    source_encoding          VARCHAR(40),
-    parser_backend           VARCHAR(40),
-    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    auditor_report_date      VARCHAR(40)
 );
 
--- Runtime SQL only needs flattened metric facts from parsed tables.
+CREATE TABLE IF NOT EXISTS tables_registry (
+    table_id                 VARCHAR(160) PRIMARY KEY,
+    filing_id                VARCHAR(128) NOT NULL REFERENCES filings(filing_id),
+    table_title              TEXT,
+    semantic_table_type      VARCHAR(80),
+    table_unit               VARCHAR(80),
+    table_markdown           TEXT,
+    footnotes                TEXT
+);
+
+-- Runtime SQL still uses flattened metric facts, but each fact now points back
+-- to a preserved table-level markdown/footnote record.
 CREATE TABLE IF NOT EXISTS metric_facts (
     value_id                 VARCHAR(220) PRIMARY KEY,
     filing_id                VARCHAR(128) NOT NULL REFERENCES filings(filing_id),
     fiscal_year              INTEGER,
-    table_id                 VARCHAR(160) NOT NULL,
+    table_id                 VARCHAR(160) NOT NULL REFERENCES tables_registry(table_id),
     section_type             VARCHAR(80),
     statement_type           VARCHAR(80),
     table_role               VARCHAR(80) NOT NULL,
@@ -30,6 +36,8 @@ CREATE TABLE IF NOT EXISTS metric_facts (
     row_index                INTEGER NOT NULL,
     raw_label                TEXT NOT NULL,
     normalized_label         TEXT,
+    parent_row_id            VARCHAR(200),
+    is_section_header        BOOLEAN NOT NULL DEFAULT FALSE,
     row_group_label          VARCHAR(120),
     company_kind             VARCHAR(40),
     col_index                INTEGER NOT NULL,
@@ -40,8 +48,7 @@ CREATE TABLE IF NOT EXISTS metric_facts (
     value_numeric            NUMERIC(30, 6),
     unit                     VARCHAR(80),
     column_header_path       TEXT,
-    is_primary_value         BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    is_primary_value         BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- Keep the exact chunk text used for Chroma ingestion for debugging and
@@ -57,11 +64,11 @@ CREATE TABLE IF NOT EXISTS text_chunks (
     text                     TEXT NOT NULL,
     is_structural_chunk      BOOLEAN NOT NULL DEFAULT FALSE,
     page_start               INTEGER,
-    page_end                 INTEGER,
-    source_file              TEXT,
-    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    page_end                 INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_tables_registry_filing ON tables_registry(filing_id);
+CREATE INDEX IF NOT EXISTS idx_tables_registry_semantic ON tables_registry(semantic_table_type);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_filing ON metric_facts(filing_id);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_year ON metric_facts(fiscal_year);
 CREATE INDEX IF NOT EXISTS idx_metric_facts_table ON metric_facts(table_id);

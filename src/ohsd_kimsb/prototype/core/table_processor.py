@@ -65,6 +65,12 @@ class TableProcessor:
         "fund": ("투자신탁", "투자조합", "펀드", "fund", "l.p"),
         "subsidiary": ("종속기업",),
     }
+    UNIT_ROW_PATTERN = re.compile(r"^\(단위\s*:\s*(.+)\)$")
+    NOISE_ROW_PATTERNS = (
+        re.compile(r"^별첨\s*주석은\s*본\s*재무제표의\s*일부입니다\.?$"),
+        re.compile(r"^계속\s*;?$"),
+    )
+    FOOTNOTE_MARKER_PATTERN = re.compile(r"\(\*[^)]+\)|\*[0-9A-Za-z가-힣]+")
 
     def __init__(
         self,
@@ -83,6 +89,8 @@ class TableProcessor:
         self.max_cols = 0
         self.label_col_idx = 0
         self.table_id = f"{self.filing_id}_{self.block.block_id}"
+        self.table_unit: Optional[str] = None
+        self.table_footnotes: List[str] = []
 
     @staticmethod
     def _make_soup(fragment: str) -> BeautifulSoup:
@@ -169,6 +177,101 @@ class TableProcessor:
             return 0.0
         numeric = sum(1 for cell in meaningful if self._is_numeric_text(self._normalize_text(cell.get("text", ""))))
         return numeric / len(meaningful)
+
+    def _row_non_empty_texts(self, row: List[Optional[Dict[str, Any]]]) -> List[str]:
+        texts: List[str] = []
+        for cell in self._unique_cells_in_row(row):
+            text = self._normalize_text(cell.get("text", ""))
+            if text:
+                texts.append(text)
+        return texts
+
+    @classmethod
+    def _matches_noise_pattern(cls, text: str) -> bool:
+        normalized = cls._normalize_text(text)
+        if not normalized:
+            return False
+        return any(pattern.fullmatch(normalized) for pattern in cls.NOISE_ROW_PATTERNS)
+
+    @classmethod
+    def _extract_footnote_markers(cls, text: str) -> List[str]:
+        return sorted(
+            {
+                cls._normalize_text(marker)
+                for marker in cls.FOOTNOTE_MARKER_PATTERN.findall(text or "")
+                if cls._normalize_text(marker)
+            }
+        )
+
+    @classmethod
+    def _looks_like_footnote_text(cls, text: str, markers: Set[str]) -> bool:
+        normalized = cls._normalize_text(text)
+        if not normalized or cls._matches_noise_pattern(normalized):
+            return False
+        if cls.FOOTNOTE_MARKER_PATTERN.match(normalized):
+            return True
+        return bool(markers and any(marker in normalized for marker in markers))
+
+    def _append_footnote(self, text: str) -> None:
+        normalized = self._normalize_text(text)
+        if not normalized or self._matches_noise_pattern(normalized):
+            return
+        if normalized not in self.table_footnotes:
+            self.table_footnotes.append(normalized)
+
+    def _sanitize_grid(self, grid: List[List[Optional[Dict[str, Any]]]]) -> List[List[Optional[Dict[str, Any]]]]:
+        footnote_markers: Set[str] = set()
+        for row in grid:
+            for text in self._row_non_empty_texts(row):
+                footnote_markers.update(self._extract_footnote_markers(text))
+
+        kept_rows: List[Tuple[int, List[Optional[Dict[str, Any]]]]] = []
+        for raw_row_idx, row in enumerate(grid):
+            texts = self._row_non_empty_texts(row)
+            if not texts:
+                continue
+
+            unique_cells = self._unique_cells_in_row(row)
+            has_explicit_header = any(cell.get("is_header") for cell in unique_cells)
+            row_text = " ".join(texts)
+            if len(texts) == 1:
+                unit_match = self.UNIT_ROW_PATTERN.match(texts[0])
+                if unit_match:
+                    extracted_unit = self._normalize_text(unit_match.group(1))
+                    if extracted_unit and self.table_unit is None:
+                        self.table_unit = extracted_unit
+                    continue
+
+            if self._matches_noise_pattern(row_text):
+                continue
+
+            if (
+                not has_explicit_header
+                and self._row_numeric_density(row) == 0
+                and self._looks_like_footnote_text(row_text, footnote_markers)
+            ):
+                self._append_footnote(row_text)
+                continue
+
+            kept_rows.append((raw_row_idx, row))
+
+        for line in (self.context_after or "").splitlines():
+            if self._looks_like_footnote_text(line, footnote_markers):
+                self._append_footnote(line)
+
+        row_index_map = {raw_row_idx: new_row_idx for new_row_idx, (raw_row_idx, _) in enumerate(kept_rows)}
+        cleaned_grid = [row for _, row in kept_rows]
+        for row in cleaned_grid:
+            for cell in self._unique_cells_in_row(row):
+                origin_row = cell.get("origin_row")
+                if origin_row in row_index_map:
+                    cell["origin_row"] = row_index_map[origin_row]
+
+        self.max_cols = max((len(row) for row in cleaned_grid), default=0)
+        for row in cleaned_grid:
+            if len(row) < self.max_cols:
+                row.extend([None] * (self.max_cols - len(row)))
+        return cleaned_grid
 
     def _unroll_grid(self) -> List[List[Optional[Dict[str, Any]]]]:
         """rowspan/colspan을 논리 grid로 확장."""
@@ -344,17 +447,32 @@ class TableProcessor:
     def _is_row_empty(self, row: List[Optional[Dict[str, Any]]]) -> bool:
         return not any(self._normalize_text(cell.get("text", "")) for cell in self._unique_cells_in_row(row))
 
+    def _looks_like_non_section_banner(self, text: str) -> bool:
+        normalized = self._normalize_text(text)
+        compact = self._compact_text(normalized)
+        if not normalized:
+            return False
+        if normalized in self.STATEMENT_TYPE_MAP:
+            return True
+        if re.search(r"^제\d+기[:：]?", compact):
+            return True
+        if re.search(r"(19|20)\d{2}년\d{1,2}월\d{1,2}일", compact):
+            return True
+        if any(token in normalized for token in ("회계법인", "대표이사", "업무수행이사")):
+            return True
+        if self._looks_like_entity_label(normalized):
+            return True
+        return False
+
     def _is_section_header(self, row: List[Optional[Dict[str, Any]]], label_text: str) -> bool:
         stripped = self._normalize_text(label_text)
         if not stripped:
             return False
         unique_cells = self._unique_cells_in_row(row)
         non_empty = [cell for cell in unique_cells if self._normalize_text(cell.get("text", ""))]
-        if unique_cells and unique_cells[0].get("colspan", 1) >= max(1, self.max_cols - 1):
-            return True
-        if len(non_empty) == 1 and self._row_numeric_density(row) == 0:
-            return True
-        if stripped.endswith(":"):
+        if len(non_empty) == 1 and non_empty[0].get("colspan", 1) >= self.max_cols:
+            return not self._looks_like_non_section_banner(stripped)
+        if len(non_empty) == 1 and stripped.endswith(":") and self._row_numeric_density(row) == 0:
             return True
         return False
 
@@ -443,6 +561,7 @@ class TableProcessor:
         row_map: Dict[int, TableRow] = {}
         rows: List[TableRow] = []
         parent_stack: Dict[int, str] = {}
+        active_section_row_id: Optional[str] = None
 
         for row_idx, row in enumerate(grid):
             if row_idx in header_row_set or self._is_row_empty(row):
@@ -456,13 +575,18 @@ class TableProcessor:
             raw_label_with_indent = label_cell.get("raw_text", raw_label)
             group_labels = self._extract_group_labels(row_idx, row)
             is_section_header = self._is_section_header(row, raw_label)
+            row_id = f"{self.table_id}_r{row_idx:04d}"
             if is_section_header:
                 row_depth = 0
+                parent_row_id = None
             else:
                 raw_depth = self._calculate_row_depth(raw_label_with_indent)
                 row_depth = self._stabilize_row_depth(raw_depth, parent_stack)
-            parent_row_id = parent_stack.get(row_depth - 1) if row_depth > 0 else None
-            row_id = f"{self.table_id}_r{row_idx:04d}"
+                if row_depth == 0 and active_section_row_id:
+                    row_depth = 1
+                    parent_row_id = active_section_row_id
+                else:
+                    parent_row_id = parent_stack.get(row_depth - 1) if row_depth > 0 else None
 
             row_obj = TableRow(
                 row_id=row_id,
@@ -481,6 +605,8 @@ class TableProcessor:
             row_map[row_idx] = row_obj
             rows.append(row_obj)
 
+            if is_section_header:
+                active_section_row_id = row_id
             parent_stack[row_depth] = row_id
             for depth in list(parent_stack):
                 if depth > row_depth:
@@ -496,15 +622,11 @@ class TableProcessor:
         context_lines = [
             self._normalize_text(line)
             for line in (self.context_before or "").splitlines()
-            if self._normalize_text(line)
+            if self._normalize_text(line) and not self._matches_noise_pattern(line)
         ]
         top_rows = []
         for row in grid[:4]:
-            row_text = " ".join(
-                self._normalize_text(cell.get("text", ""))
-                for cell in self._unique_cells_in_row(row)
-                if self._normalize_text(cell.get("text", ""))
-            )
+            row_text = " ".join(self._row_non_empty_texts(row))
             if row_text:
                 top_rows.append(row_text)
         candidate_text = "\n".join(context_lines[-6:] + top_rows)
@@ -525,8 +647,12 @@ class TableProcessor:
                     title = line
                     break
 
-        unit_match = re.search(r"\(\s*단위\s*[:：]?\s*([^)]+)\)", candidate_text)
-        unit = self._normalize_text(unit_match.group(1)) if unit_match else None
+        unit = self.table_unit
+        if unit is None:
+            unit_match = re.search(r"\(\s*단위\s*[:：]?\s*([^)]+)\)", candidate_text)
+            unit = self._normalize_text(unit_match.group(1)) if unit_match else None
+            if unit:
+                self.table_unit = unit
 
         year_tokens = re.findall(r"(19\d{2}|20\d{2})", candidate_text)
         for col_info in col_headers.values():
@@ -534,6 +660,33 @@ class TableProcessor:
             year_tokens.extend(re.findall(r"(19\d{2}|20\d{2})", joined))
         years = sorted({int(token) for token in year_tokens})
         return title, unit, years
+
+    @staticmethod
+    def _escape_markdown_cell(text: str) -> str:
+        return text.replace("|", "\\|")
+
+    def _build_table_markdown(self, grid: List[List[Optional[Dict[str, Any]]]]) -> str:
+        unit_label = self.table_unit or "미확인"
+        lines = [f"**[표 단위: {unit_label}]**"]
+        if not grid or self.max_cols <= 0:
+            return "\n".join(lines)
+
+        header = [f"열{idx + 1}" for idx in range(self.max_cols)]
+        separator = ["---"] * self.max_cols
+        lines.append("")
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| " + " | ".join(separator) + " |")
+
+        for row_idx, row in enumerate(grid):
+            rendered_row: List[str] = []
+            for col_idx in range(self.max_cols):
+                cell = row[col_idx] if col_idx < len(row) else None
+                if not cell or (cell.get("origin_row"), cell.get("origin_col")) != (row_idx, col_idx):
+                    rendered_row.append("")
+                    continue
+                rendered_row.append(self._escape_markdown_cell(self._normalize_text(cell.get("text", ""))))
+            lines.append("| " + " | ".join(rendered_row) + " |")
+        return "\n".join(lines)
 
     def _has_numeric_body(self, grid: List[List[Optional[Dict[str, Any]]]], header_rows: List[int]) -> bool:
         header_set = set(header_rows)
@@ -987,12 +1140,16 @@ class TableProcessor:
         if not raw_grid:
             return None
 
-        header_rows = self._find_header_rows(raw_grid)
-        col_headers = self._build_column_headers(raw_grid, header_rows)
-        self.label_col_idx = self._detect_label_column_index(raw_grid, col_headers, header_rows)
-        row_map, rows = self._build_row_hierarchy(raw_grid, header_rows)
-        title, unit, year_candidates = self._extract_table_title_unit_years(raw_grid, col_headers)
-        table_role, table_subrole = self._classify_table(raw_grid, title)
+        grid = self._sanitize_grid(raw_grid)
+        if not grid:
+            return None
+
+        header_rows = self._find_header_rows(grid)
+        col_headers = self._build_column_headers(grid, header_rows)
+        self.label_col_idx = self._detect_label_column_index(grid, col_headers, header_rows)
+        row_map, rows = self._build_row_hierarchy(grid, header_rows)
+        title, unit, year_candidates = self._extract_table_title_unit_years(grid, col_headers)
+        table_role, table_subrole = self._classify_table(grid, title)
         semantic_table_type = self._infer_semantic_table_type_v2(
             title=title,
             table_role=table_role,
@@ -1002,7 +1159,8 @@ class TableProcessor:
         )
         self._annotate_row_company_kind(rows=rows, semantic_table_type=semantic_table_type, title=title)
         statement_type = self._infer_statement_type(title)
-        cells, values = self._build_cells_and_values(raw_grid, col_headers, row_map, unit)
+        cells, values = self._build_cells_and_values(grid, col_headers, row_map, unit)
+        table_markdown = self._build_table_markdown(grid)
 
         return NormalizedTable(
             table_id=self.table_id,
@@ -1014,6 +1172,8 @@ class TableProcessor:
             semantic_table_type=semantic_table_type,
             title=title,
             unit=unit,
+            table_markdown=table_markdown,
+            footnotes="\n".join(self.table_footnotes) or None,
             year_candidates=year_candidates,
             context_before=self.context_before or None,
             context_after=self.context_after or None,
@@ -1027,7 +1187,9 @@ class TableProcessor:
             metadata={
                 "max_cols": self.max_cols,
                 "label_col_index": self.label_col_idx,
-                "row_count": len(raw_grid),
+                "row_count": len(grid),
+                "raw_row_count": len(raw_grid),
                 "header_row_indexes": header_rows,
+                "footnote_count": len(self.table_footnotes),
             },
         )

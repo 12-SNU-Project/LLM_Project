@@ -323,18 +323,26 @@ class AuditReportPipeline:
                 "filing_id": result.meta.filing_id,
                 "company_name": result.meta.company_name,
                 "fiscal_year": result.meta.fiscal_year,
-                "report_type": result.meta.report_type,
                 "auditor_name": result.meta.auditor_name,
                 "auditor_report_date": result.meta.auditor_report_date,
-                "source_file": result.meta.source_file,
-                "source_encoding": result.meta.source_encoding,
-                "parser_backend": result.meta.parser_backend,
             }
         ]
 
+        tables_registry_payload: List[Dict[str, object]] = []
         metric_facts_payload: List[Dict[str, object]] = []
 
         for table in result.tables:
+            tables_registry_payload.append(
+                {
+                    "table_id": table.table_id,
+                    "filing_id": table.filing_id,
+                    "table_title": table.title,
+                    "semantic_table_type": table.semantic_table_type,
+                    "table_unit": table.unit,
+                    "table_markdown": table.table_markdown,
+                    "footnotes": table.footnotes,
+                }
+            )
             row_lookup = {row.row_id: row for row in table.rows}
 
             for value in table.values:
@@ -360,6 +368,8 @@ class AuditReportPipeline:
                         "row_index": row.row_index,
                         "raw_label": row.raw_label,
                         "normalized_label": row.normalized_label,
+                        "parent_row_id": row.parent_row_id,
+                        "is_section_header": row.is_section_header,
                         "row_group_label": row.metadata.get("group_label"),
                         "company_kind": row.metadata.get("company_kind"),
                         "col_index": value.col_index,
@@ -376,9 +386,10 @@ class AuditReportPipeline:
 
         # Runtime SQLite is intentionally lean: table metrics go into one flat
         # fact table. We still keep text_chunks so the exact Chroma source
-        # texts remain inspectable during debugging.
+        # texts remain inspectable during debugging, but omit local file paths.
         return {
             "filings": filings,
+            "tables_registry": tables_registry_payload,
             "metric_facts": metric_facts_payload,
             "text_chunks": [
                 {
@@ -393,7 +404,6 @@ class AuditReportPipeline:
                     "is_structural_chunk": chunk.is_structural_chunk,
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
-                    "source_file": chunk.source_file,
                 }
                 for chunk in result.text_chunks
             ],
