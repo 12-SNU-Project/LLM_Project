@@ -27,7 +27,7 @@ VECTOR_PATH = f"{BASE}/chroma_db"
 SQLITE_PATH = f"{BASE}/audit_data.db"
 OLLAMA_URL  = "http://localhost:11434"
 EMBED_MODEL = "qwen3-embedding:4b"
-LLM_MODEL   = "qwen2.5:7b"
+LLM_MODEL   = "qwen2.5:14b"
 
 # ── 국가명 셋 (location 검색 감지용)
 COUNTRY_NAMES = {
@@ -176,14 +176,8 @@ class AuditRAG:
         # 수정4: 국가명 감지 → location 검색용
         location = next((c for c in COUNTRY_NAMES if c in query), None)
 
-        # company_name + 약어 추출 (국가명은 금지어로 걸러짐)
+        # company_name 후보 추출 (국가명은 금지어로 걸러짐)
         company_name = None
-        # 괄호 안 약어 추출 (예: SIEL, SEA, SEUK)
-        abbr = None
-        abbr_match = re.search(r"\(([A-Z]{2,6})\)", query)
-        if abbr_match:
-            abbr = abbr_match.group(1)
-
         eng = re.findall(r"[A-Z][a-zA-Z\s&\-\.\(\)㈜]+", query)
         if eng:
             company_name = max(eng, key=len).strip()
@@ -208,8 +202,7 @@ class AuditRAG:
             "year":         year,
             "is_trend":     is_trend,
             "company_name": company_name,
-            "abbr":         abbr,        # 괄호 안 약어 (SIEL, SEA 등)
-            "location":     location,
+            "location":     location,   # 수정4: 국가명 추가
             "fields":       fields,
         }
 
@@ -219,7 +212,6 @@ class AuditRAG:
         """벡터 검색 → SQLite 병합 → 최종 기업 리스트 반환"""
         year         = parsed["year"]
         company_name = parsed["company_name"]
-        abbr         = parsed.get("abbr")
         location     = parsed["location"]
         is_trend     = parsed["is_trend"]
 
@@ -248,13 +240,12 @@ class AuditRAG:
                 if pair not in candidates:
                     candidates.append(pair)
 
-        # 재정렬: company_name/약어 포함 + 최신 연도 가산점
+        # 재정렬: company_name 포함 + 최신 연도 가산점
         def score(pair):
             name, yr = pair
             s = 0
             if company_name and company_name in name: s += 10
             if company_name and name in company_name: s += 5
-            if abbr and f"({abbr})" in name:          s += 20  # 약어 정확 매칭 최우선
             s += yr / 1000
             return s
 
@@ -270,12 +261,12 @@ class AuditRAG:
             if is_trend and not year:
                 years = self._get_trend_years(cname, n=3)
                 for ty in years:
-                    rows = self._sqlite_query(cname, ty, abbr)
+                    rows = self._sqlite_query(cname, ty)
                     if rows:
                         merged_list.append(self._merge_rows(rows))
                 continue
 
-            rows = self._sqlite_query(cname, yr if yr else year, abbr)
+            rows = self._sqlite_query(cname, yr if yr else year)
             if not rows:
                 continue
             merged_list.append(self._merge_rows(rows))
@@ -323,37 +314,25 @@ class AuditRAG:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def _sqlite_query(self, company_name: str, year: Optional[int],
-                      abbr: Optional[str] = None) -> List[Dict]:
-        """정확 매칭 → LIKE → 약어 LIKE → MAX(year) fallback"""
+    def _sqlite_query(self, company_name: str, year: Optional[int]) -> List[Dict]:
+        """정확 매칭 우선, 없으면 LIKE, 그래도 없으면 MAX(year) fallback"""
         def fetch(sql, params):
             return [dict(r) for r in self.db.execute(sql, params).fetchall()]
 
-        target_yr = year or self.db.execute("SELECT MAX(year) FROM subsidiaries").fetchone()[0]
-
-        # 1. 정확 매칭
-        rows = fetch("SELECT * FROM subsidiaries WHERE company_name = ? AND year = ?",
-                     [company_name, target_yr])
-        if rows: return rows
-
-        # 2. LIKE 매칭
-        rows = fetch("SELECT * FROM subsidiaries WHERE company_name LIKE ? AND year = ?",
-                     [f"%{company_name}%", target_yr])
-        if rows: return rows
-
-        # 3. 약어로 LIKE 매칭 (SIEL, SEA 등)
-        if abbr:
+        if year:
+            rows = fetch("SELECT * FROM subsidiaries WHERE company_name = ? AND year = ?",
+                         [company_name, year])
+            if rows: return rows
             rows = fetch("SELECT * FROM subsidiaries WHERE company_name LIKE ? AND year = ?",
-                         [f"%({abbr})%", target_yr])
+                         [f"%{company_name}%", year])
             if rows: return rows
 
-        # 4. year 없이 전체 fallback (최신순)
+        max_year = self.db.execute("SELECT MAX(year) FROM subsidiaries").fetchone()[0]
+        rows = fetch("SELECT * FROM subsidiaries WHERE company_name LIKE ? AND year = ?",
+                     [f"%{company_name}%", max_year])
+        if rows: return rows
         rows = fetch("SELECT * FROM subsidiaries WHERE company_name LIKE ? ORDER BY year DESC LIMIT 20",
                      [f"%{company_name}%"])
-        if rows: return rows
-        if abbr:
-            rows = fetch("SELECT * FROM subsidiaries WHERE company_name LIKE ? ORDER BY year DESC LIMIT 20",
-                         [f"%({abbr})%"])
         return rows
 
     def _merge_rows(self, rows: List[Dict]) -> Dict:
