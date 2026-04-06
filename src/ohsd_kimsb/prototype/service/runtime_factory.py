@@ -37,13 +37,19 @@ class PrototypeRuntimeConfig:
     intent_model: str = "qwen3:8b"
     answer_model: str = "qwen3:8b"
     embedding_model: str = "qwen3-embedding:8b"
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://127.0.0.1:11434"
     chroma_collection_name: str = "audit_chunks"
     chroma_persist_directory: Optional[str] = None
     prefer_langchain: bool = True
     prefer_chroma: bool = True
     allow_fallback: bool = True
     reset_chroma_collection: bool = False
+    embedding_upsert_batch_size: int = 32
+    log_vector_ingest_progress: bool = False
+    embedding_timeout: int = 120
+    embedding_keep_alive: Optional[int] = 300
+    ollama_num_gpu: Optional[int] = 1
+    ollama_num_thread: Optional[int] = None
 
 
 @dataclass
@@ -83,6 +89,11 @@ class PrototypeRuntimeFactory:
             "prefer_langchain": self.config.prefer_langchain,
             "prefer_chroma": self.config.prefer_chroma,
             "vector_document_count": len(documents),
+            "embedding_upsert_batch_size": self.config.embedding_upsert_batch_size,
+            "embedding_timeout": self.config.embedding_timeout,
+            "embedding_keep_alive": self.config.embedding_keep_alive,
+            "ollama_num_gpu": self.config.ollama_num_gpu,
+            "ollama_num_thread": self.config.ollama_num_thread,
             "fallbacks": [],
         }
 
@@ -113,6 +124,8 @@ class PrototypeRuntimeFactory:
             LocalLLMConfig(
                 model=self.config.intent_model,
                 base_url=self.config.ollama_base_url,
+                num_gpu=self.config.ollama_num_gpu,
+                num_thread=self.config.ollama_num_thread,
             )
         )
         runtime_report["query_interpreter_backend"] = "langchain_ollama"
@@ -124,6 +137,8 @@ class PrototypeRuntimeFactory:
             LocalLLMConfig(
                 model=self.config.answer_model,
                 base_url=self.config.ollama_base_url,
+                num_gpu=self.config.ollama_num_gpu,
+                num_thread=self.config.ollama_num_thread,
             )
         )
         runtime_report["answer_backend"] = "langchain_ollama"
@@ -149,6 +164,10 @@ class PrototypeRuntimeFactory:
                 LocalEmbeddingConfig(
                     model=self.config.embedding_model,
                     base_url=self.config.ollama_base_url,
+                    timeout=self.config.embedding_timeout,
+                    keep_alive=self.config.embedding_keep_alive,
+                    num_gpu=self.config.ollama_num_gpu,
+                    num_thread=self.config.ollama_num_thread,
                 )
             )
             vector_store = ChromaVectorStore(
@@ -156,13 +175,15 @@ class PrototypeRuntimeFactory:
                 persist_directory=str(persist_directory),
                 embedding_model=embedding_model,
                 reset_collection=self.config.reset_chroma_collection,
+                upsert_batch_size=self.config.embedding_upsert_batch_size,
+                log_ingest_progress=self.config.log_vector_ingest_progress,
             )
             # Validate the collection at startup so service-mode failures are
             # reported before the first user query.
             _ = vector_store.collection
             # Keep ingestion separate from service-time retrieval loading.
             if ingest_documents:
-                vector_store.upsert_documents(documents)
+                runtime_report["vector_ingest_stats"] = vector_store.upsert_documents(documents)
             runtime_report["vector_backend"] = "chroma"
             runtime_report["embedding_backend"] = "ollama_embeddings"
             runtime_report["embedding_runtime_available"] = LangChainLocalEmbedding.runtime_available()

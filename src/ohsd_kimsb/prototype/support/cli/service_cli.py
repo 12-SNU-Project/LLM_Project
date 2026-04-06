@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sqlite3
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -25,6 +27,19 @@ def _configure_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8")
+
+
+def _configure_runtime_noise() -> None:
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+    os.environ.setdefault("GLOG_minloglevel", "2")
+    os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Unable to find acceptable character detection dependency.*",
+        category=Warning,
+        module=r"requests(\..*)?$",
+    )
 
 
 def _load_manifest(manifest_path: Path) -> dict:
@@ -240,6 +255,7 @@ def _print_pretty_response(question: str, response: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    _configure_runtime_noise()
     _configure_stdio()
     repo_root, prototype_dir = _bootstrap_paths()
     workspace_pkg = prototype_dir.parent.name
@@ -263,7 +279,9 @@ def main() -> None:
     parser.add_argument("--intent-model", default="qwen3:8b", help="local LLM for query interpretation")
     parser.add_argument("--answer-model", default="qwen3:8b", help="local LLM for final answer generation")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b", help="embedding model for Chroma")
-    parser.add_argument("--ollama-base-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434", help="Ollama base URL")
+    parser.add_argument("--ollama-num-gpu", type=int, default=1, help="Ollama GPU 사용 수. macOS에서는 1이 Metal GPU 사용")
+    parser.add_argument("--ollama-num-thread", type=int, default=0, help="Ollama CPU thread 수. 0이면 Ollama 자동 결정")
     parser.add_argument("--force-inmemory", action="store_true", help="use in-memory vector store instead of Chroma")
     parser.add_argument("--strict-runtime", action="store_true", help="abort instead of falling back on runtime errors")
     parser.add_argument("--json", action="store_true", help="print raw JSON response instead of pretty text")
@@ -283,7 +301,9 @@ def main() -> None:
 
     collection_name = args.collection_name or manifest.get("collection_name") or "audit_chunks"
     embedding_model = args.embedding_model or manifest.get("embedding_model") or "qwen3-embedding:8b"
-    ollama_base_url = args.ollama_base_url or manifest.get("ollama_base_url") or "http://localhost:11434"
+    ollama_base_url = args.ollama_base_url or manifest.get("ollama_base_url") or "http://127.0.0.1:11434"
+    ollama_num_gpu = args.ollama_num_gpu if args.ollama_num_gpu >= 0 else manifest.get("ollama_num_gpu")
+    ollama_num_thread = args.ollama_num_thread if args.ollama_num_thread > 0 else manifest.get("ollama_num_thread")
 
     if not db_path.exists():
         raise SystemExit(f"SQLite DB not found: {db_path}")
@@ -300,6 +320,8 @@ def main() -> None:
             prefer_chroma=not args.force_inmemory,
             allow_fallback=not args.strict_runtime,
             reset_chroma_collection=False,
+            ollama_num_gpu=ollama_num_gpu,
+            ollama_num_thread=ollama_num_thread,
         )
     ).build(parse_results=None, repo_root=repo_root)
 
