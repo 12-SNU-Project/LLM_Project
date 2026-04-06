@@ -7,6 +7,32 @@ from typing import Any, Dict, List, Optional
 from .catalog import METRIC_DEFINITIONS
 from .schema import QueryIntent, QueryInterpretation, SQLQueryPlan
 
+TABLE_CONTEXT_SELECT = """
+SELECT
+    t.table_id,
+    t.filing_id,
+    t.table_title,
+    t.semantic_table_type,
+    t.table_unit,
+    t.table_markdown,
+    t.footnotes
+FROM tables_registry t
+WHERE t.filing_id = ? AND t.semantic_table_type = ?
+"""
+
+TABLE_CONTEXT_BY_TABLE_IDS_SELECT = """
+SELECT
+    t.table_id,
+    t.filing_id,
+    t.table_title,
+    t.semantic_table_type,
+    t.table_unit,
+    t.table_markdown,
+    t.footnotes
+FROM tables_registry t
+WHERE t.table_id IN ({placeholders})
+"""
+
 
 class SQLTemplateEngine:
     # Runtime DB keeps one flat fact table, so metric lookups only need a few
@@ -90,6 +116,310 @@ JOIN filings f ON m.filing_id = f.filing_id
         rows = conn.execute(plan.sql, plan.params).fetchall()
         return [dict(row) for row in rows]
 
+    def fetch_table_contexts(
+        self,
+        conn: sqlite3.Connection,
+        table_ids: Optional[List[str]] = None,
+        filing_id: Optional[str] = None,
+        semantic_types: Optional[List[str]] = None,
+        table_title_terms: Optional[List[str]] = None,
+        sql_rows: Optional[List[Dict[str, Any]]] = None,
+        interpretation: Optional[QueryInterpretation] = None,
+        required_dimensions: Optional[List[str]] = None,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        conn.row_factory = sqlite3.Row
+        table_ids = self._dedupe_strs(table_ids or [])
+        semantic_types = self._dedupe_strs(semantic_types or [])
+        table_title_terms = self._dedupe_strs(table_title_terms or [])
+        required_dimensions = self._dedupe_strs(required_dimensions or [])
+        sql_rows = list(sql_rows or [])
+
+        contexts: List[Dict[str, Any]] = []
+        if table_ids:
+            placeholders = self._placeholders(table_ids)
+            sql = TABLE_CONTEXT_BY_TABLE_IDS_SELECT.format(placeholders=placeholders)
+            rows = conn.execute(sql, table_ids).fetchall()
+            row_map = {str(row["table_id"]): dict(row) for row in rows}
+            contexts.extend(row_map[table_id] for table_id in table_ids if table_id in row_map)
+
+        if not contexts and filing_id and semantic_types:
+            for semantic_type in semantic_types:
+                rows = conn.execute(TABLE_CONTEXT_SELECT, [filing_id, semantic_type]).fetchall()
+                for row in rows:
+                    context = dict(row)
+                    contexts.append(context)
+
+        filtered = [
+            context
+            for context in contexts
+            if str(context.get("table_markdown") or "").strip() or str(context.get("footnotes") or "").strip()
+        ]
+        if table_title_terms:
+            title_filtered = [
+                context
+                for context in filtered
+                if any(term in str(context.get("table_title") or "") for term in table_title_terms)
+            ]
+            if title_filtered:
+                filtered = title_filtered
+
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for context in filtered:
+            key = (
+                context.get("table_id"),
+                context.get("table_title"),
+                context.get("semantic_table_type"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            matched_rows = self._match_context_sql_rows(context, sql_rows)
+            deduped.append(
+                self._focus_table_context(
+                    context=context,
+                    sql_rows=matched_rows,
+                    interpretation=interpretation,
+                    required_dimensions=required_dimensions,
+                )
+            )
+        deduped.sort(
+            key=lambda context: self._table_context_rank(
+                context=context,
+                prioritized_table_ids=table_ids,
+                table_title_terms=table_title_terms,
+                required_dimensions=required_dimensions,
+            ),
+            reverse=True,
+        )
+        return deduped[: max(1, limit)]
+
+    def _focus_table_context(
+        self,
+        context: Dict[str, Any],
+        sql_rows: List[Dict[str, Any]],
+        interpretation: Optional[QueryInterpretation],
+        required_dimensions: List[str],
+    ) -> Dict[str, Any]:
+        focused = dict(context)
+        focus_row_labels = self._dedupe_strs(
+            [
+                *(row.get("raw_label") or row.get("normalized_label") or "" for row in sql_rows),
+                *((interpretation.row_label_terms + interpretation.row_label_filters) if interpretation else []),
+            ]
+        )
+        focus_column_keys = self._dedupe_strs(
+            [
+                *(row.get("column_key") or "" for row in sql_rows),
+                *(row.get("period") or "" for row in sql_rows),
+                *(interpretation.column_terms if interpretation else []),
+            ]
+        )
+        focused["focus_row_labels"] = focus_row_labels
+        focused["focus_column_keys"] = focus_column_keys
+        focused["focused_table_markdown"] = self._build_focused_table_markdown(
+            table_markdown=str(context.get("table_markdown") or ""),
+            focus_row_labels=focus_row_labels,
+            focus_column_keys=focus_column_keys,
+            required_dimensions=required_dimensions,
+        )
+        focused["focused_footnotes"] = self._build_focused_footnotes(
+            footnotes=str(context.get("footnotes") or ""),
+            interpretation=interpretation,
+            focus_row_labels=focus_row_labels,
+            focus_column_keys=focus_column_keys,
+            required_dimensions=required_dimensions,
+        )
+        return focused
+
+    @staticmethod
+    def _match_context_sql_rows(
+        context: Dict[str, Any],
+        sql_rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        table_id = str(context.get("table_id") or "").strip()
+        if table_id:
+            exact = [row for row in sql_rows if str(row.get("table_id") or "").strip() == table_id]
+            if exact:
+                return exact
+
+        semantic_type = str(context.get("semantic_table_type") or "").strip()
+        if semantic_type:
+            semantic_rows = [
+                row
+                for row in sql_rows
+                if str(row.get("semantic_table_type") or "").strip() == semantic_type
+            ]
+            if semantic_rows:
+                return semantic_rows
+        return sql_rows
+
+    def _build_focused_table_markdown(
+        self,
+        table_markdown: str,
+        focus_row_labels: List[str],
+        focus_column_keys: List[str],
+        required_dimensions: List[str],
+    ) -> str:
+        if not table_markdown.strip():
+            return ""
+        structure_requested = "structure" in required_dimensions
+        if not structure_requested and not focus_row_labels and not focus_column_keys:
+            return ""
+
+        lines = [line.rstrip() for line in table_markdown.splitlines() if line.strip()]
+        prefix_lines = [line for line in lines if not line.lstrip().startswith("|")]
+        table_lines = [line for line in lines if line.lstrip().startswith("|")]
+        if len(table_lines) < 2:
+            return "\n".join(prefix_lines[:2])
+
+        header_cells = self._parse_markdown_row(table_lines[0])
+        if not header_cells:
+            return "\n".join(prefix_lines[:2])
+        has_align_row = len(table_lines) > 1 and self._is_alignment_row(table_lines[1])
+        body_lines = table_lines[2:] if has_align_row else table_lines[1:]
+        semantic_header_cells = header_cells
+        if self._is_placeholder_header(header_cells) and body_lines:
+            semantic_header_cells = self._parse_markdown_row(body_lines[0]) or header_cells
+            body_lines = body_lines[1:]
+
+        selected_column_indices = self._select_column_indices(semantic_header_cells, focus_column_keys)
+        if len(selected_column_indices) == 1 and len(semantic_header_cells) > 1:
+            selected_column_indices = self._fallback_column_indices(semantic_header_cells)
+
+        selected_rows: List[List[str]] = []
+        row_terms = [self._compact_text(term) for term in focus_row_labels if str(term).strip()]
+        for line in body_lines:
+            cells = self._parse_markdown_row(line)
+            if not cells:
+                continue
+            label = self._compact_text(cells[0])
+            if row_terms and any(term and (term in label or label in term) for term in row_terms):
+                selected_rows.append(cells)
+
+        if not selected_rows:
+            selected_rows = [
+                self._parse_markdown_row(line)
+                for line in body_lines[: min(3, len(body_lines))]
+                if self._parse_markdown_row(line)
+            ]
+
+        selected_indices = sorted(selected_column_indices)
+        focused_lines = list(prefix_lines[:2])
+        focused_lines.append(self._compose_markdown_row([semantic_header_cells[idx] for idx in selected_indices]))
+        focused_lines.append(self._compose_markdown_row(["---"] * len(selected_indices)))
+        for cells in selected_rows[:4]:
+            padded = list(cells) + [""] * max(0, len(semantic_header_cells) - len(cells))
+            focused_lines.append(self._compose_markdown_row([padded[idx] for idx in selected_indices]))
+        return "\n".join(line for line in focused_lines if line)
+
+    def _build_focused_footnotes(
+        self,
+        footnotes: str,
+        interpretation: Optional[QueryInterpretation],
+        focus_row_labels: List[str],
+        focus_column_keys: List[str],
+        required_dimensions: List[str],
+    ) -> str:
+        if not footnotes.strip() or "footnote" not in required_dimensions:
+            return ""
+
+        query_markers = self._extract_footnote_markers(interpretation.raw_question if interpretation else "")
+        markers = query_markers or self._extract_footnote_markers(focus_row_labels, focus_column_keys)
+        lines = [line.strip() for line in footnotes.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        if markers:
+            segments = self._split_footnote_segments("\n".join(lines))
+            selected = [segment for segment in segments if any(marker in segment for marker in markers)]
+            if selected:
+                return "\n".join(selected)
+
+        focus_terms = [self._compact_text(term) for term in [*focus_row_labels, *focus_column_keys] if str(term).strip()]
+        if focus_terms:
+            selected = [
+                line
+                for line in lines
+                if any(term in self._compact_text(line) for term in focus_terms)
+            ]
+            if selected:
+                return "\n".join(selected[:2])
+        return "\n".join(lines[:1])
+
+    def _select_column_indices(self, header_cells: List[str], focus_column_keys: List[str]) -> set[int]:
+        selected = {0}
+        column_terms = [self._compact_text(term) for term in focus_column_keys if str(term).strip()]
+        for idx, cell in enumerate(header_cells[1:], start=1):
+            compact_cell = self._compact_text(cell)
+            if any(term and (term in compact_cell or compact_cell in term) for term in column_terms):
+                selected.add(idx)
+        return selected
+
+    def _fallback_column_indices(self, header_cells: List[str], limit: int = 5) -> set[int]:
+        selected = {0}
+        for idx, cell in enumerate(header_cells[1:], start=1):
+            compact_cell = self._compact_text(cell)
+            if compact_cell in {"합계", "계", "총계", "주석"}:
+                continue
+            selected.add(idx)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    @staticmethod
+    def _parse_markdown_row(line: str) -> List[str]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            return []
+        stripped = stripped.strip("|")
+        return [cell.strip() for cell in stripped.split("|")]
+
+    @staticmethod
+    def _compose_markdown_row(cells: List[str]) -> str:
+        return "| " + " | ".join(cells) + " |"
+
+    @staticmethod
+    def _is_alignment_row(line: str) -> bool:
+        compact = line.replace("|", "").replace(":", "").replace("-", "").replace(" ", "")
+        return compact == ""
+
+    @staticmethod
+    def _is_placeholder_header(cells: List[str]) -> bool:
+        if not cells:
+            return False
+        return all(re.fullmatch(r"열\d+", cell or "") for cell in cells)
+
+    @staticmethod
+    def _extract_footnote_markers(*values: Any) -> List[str]:
+        markers: List[str] = []
+        for value in values:
+            text = str(value or "")
+            for marker in re.findall(r"\(\*\d+\)|\[\*\d+\]", text):
+                if marker not in markers:
+                    markers.append(marker)
+        return markers
+
+    @staticmethod
+    def _split_footnote_segments(text: str) -> List[str]:
+        if not text.strip():
+            return []
+        matches = re.finditer(r"(\(\*\d+\)|\[\*\d+\])", text)
+        spans = [(match.start(), match.group(1)) for match in matches]
+        if not spans:
+            return [text.strip()]
+        segments: List[str] = []
+        for index, (start, _) in enumerate(spans):
+            end = spans[index + 1][0] if index + 1 < len(spans) else len(text)
+            segment = text[start:end].strip()
+            if segment:
+                segments.append(segment)
+        return segments
+
+    @staticmethod
+    def _compact_text(value: Any) -> str:
+        return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(value or "")).lower()
+
     def _build_metric_lookup(self, interpretation: QueryInterpretation) -> SQLQueryPlan:
         label_candidates = self._expand_label_candidates(interpretation.metric_candidates)
         column_candidates = self._expand_column_candidates(interpretation.metric_candidates)
@@ -108,6 +438,17 @@ JOIN filings f ON m.filing_id = f.filing_id
         elif interpretation.year_range is not None:
             where_clauses.append("f.fiscal_year BETWEEN ? AND ?")
             params.extend(list(interpretation.year_range))
+
+        table_title_filter_terms = list(interpretation.table_title_terms)
+        if interpretation.row_label_filters and len(table_title_filter_terms) <= 1:
+            table_title_filter_terms = []
+        if table_title_filter_terms:
+            where_clauses.append(self._build_like_clause(self.TITLE_EXPR, table_title_filter_terms))
+            params.extend([self._like_param(value) for value in table_title_filter_terms])
+
+        if interpretation.row_label_filters and interpretation.column_terms:
+            where_clauses.append(self._build_like_clause(self.COLUMN_EXPR, interpretation.column_terms))
+            params.extend([self._like_param(value) for value in interpretation.column_terms])
 
         sql = (
             self.BASE_SELECT
@@ -168,6 +509,13 @@ WITH target_years AS (
             statement_types=statement_types,
         )
         where_clauses.append(year_filter_sql)
+
+        table_title_filter_terms = list(interpretation.table_title_terms)
+        if interpretation.row_label_filters and len(table_title_filter_terms) <= 1:
+            table_title_filter_terms = []
+        if table_title_filter_terms:
+            where_clauses.append(self._build_like_clause(self.TITLE_EXPR, table_title_filter_terms))
+            metric_params.extend([self._like_param(value) for value in table_title_filter_terms])
 
         if cte:
             params = list(year_params) + metric_params
@@ -459,6 +807,46 @@ WITH target_years AS (
             "ELSE 9 END, "
             "CASE WHEN COALESCE(m.column_key, '') IN ('합계', '합_계', '계') THEN 9 ELSE 0 END"
         )
+
+    @staticmethod
+    def _table_context_rank(
+        context: Dict[str, Any],
+        prioritized_table_ids: List[str],
+        table_title_terms: List[str],
+        required_dimensions: List[str],
+    ) -> tuple[int, int, int, int, int]:
+        table_id = str(context.get("table_id") or "")
+        title = str(context.get("table_title") or "")
+        markdown = str(context.get("table_markdown") or "").strip()
+        footnotes = str(context.get("footnotes") or "").strip()
+        unit = str(context.get("table_unit") or "").strip()
+        exact_table_rank = 0
+        if table_id in prioritized_table_ids:
+            exact_table_rank = len(prioritized_table_ids) - prioritized_table_ids.index(table_id)
+        title_match_count = sum(term in title for term in table_title_terms)
+        dimension_score = 0
+        if "structure" in required_dimensions and markdown:
+            dimension_score += 1
+        if "unit" in required_dimensions and unit:
+            dimension_score += 1
+        if "footnote" in required_dimensions and footnotes:
+            dimension_score += 1
+        return (
+            exact_table_rank,
+            title_match_count,
+            dimension_score,
+            int(bool(markdown)),
+            int(bool(footnotes)),
+        )
+
+    @staticmethod
+    def _dedupe_strs(values: List[Any]) -> List[str]:
+        deduped: List[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in deduped:
+                deduped.append(text)
+        return deduped
 
     @staticmethod
     def _placeholders(values: List[Any]) -> str:

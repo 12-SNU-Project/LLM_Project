@@ -62,6 +62,9 @@ class EvidenceBundle:
     applied_vector_filter: Dict[str, Any]
     sql_results: List[Dict[str, Any]] = field(default_factory=list)
     vector_hits: List[VectorSearchHit] = field(default_factory=list)
+    table_contexts: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_requirements: List[str] = field(default_factory=list)
+    evidence_gaps: List[str] = field(default_factory=list)
     citations: List[Dict[str, Any]] = field(default_factory=list)
     retrieval_summary: Dict[str, Any] = field(default_factory=dict)
 
