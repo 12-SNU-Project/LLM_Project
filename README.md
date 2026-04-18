@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Project Status](https://img.shields.io/badge/status-in%20progress-yellow)
+![Project Status](https://img.shields.io/badge/status-%20complete-green)
 
 **LLM 처리 기반 RAG 시스템 구현**
 
